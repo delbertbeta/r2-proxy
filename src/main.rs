@@ -60,6 +60,8 @@ async fn main() -> anyhow::Result<()> {
     
     // Create routes
     let app = Router::new()
+        .route("/", get(proxy_handler))
+        .route("/", options(handle_options))
         .route("/*path", get(proxy_handler))
         .route("/*path", options(handle_options))
         .layer(cors)
@@ -73,10 +75,10 @@ async fn main() -> anyhow::Result<()> {
     let cache_clone = cache.clone();
     tokio::spawn(async move {
         loop {
+            tokio::time::sleep(std::time::Duration::from_secs(600)).await;
             if let Err(e) = refresh_cache(&kv_client_clone, &cache_clone).await {
                 tracing::error!("Refresh cache failed: {}", e);
             }
-            tokio::time::sleep(std::time::Duration::from_secs(600)).await;
         }
     });
 
