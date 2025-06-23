@@ -1,8 +1,9 @@
 use crate::errors::ProxyError;
 use aws_config::BehaviorVersion;
-use aws_sdk_s3::{Client, Config};
+use aws_sdk_s3::{ Client, Config};
 use axum::body::Body;
-use tracing::{debug, error, warn};
+use tracing::{debug, warn};
+use tokio_util::io::ReaderStream;
 
 pub struct S3Response {
     pub body: Body,
@@ -68,16 +69,10 @@ impl S3Client {
         let etag = output.e_tag().map(|s| s.to_string());
         let last_modified = output.last_modified().map(|dt| dt.to_string());
 
-        // 创建响应体 - 直接读取所有数据
-        let s3_body = output.body;
-        let body = {
-            // Read all data into memory
-            let bytes = s3_body.collect().await.map_err(|e| {
-                error!("S3 stream read error: {}", e);
-                ProxyError::InternalError(format!("S3 stream read error: {}", e))
-            })?;
-            Body::from(bytes.into_bytes())
-        };
+        // 流式转发 S3 响应体
+        let s3_body = output.body.into_async_read();
+        let stream = ReaderStream::new(s3_body);
+        let body = Body::from_stream(stream);
 
         Ok(S3Response {
             body,
