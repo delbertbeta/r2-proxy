@@ -26,6 +26,7 @@ use s3_client::S3Client;
 struct AppCache {
     whitelist: HashMap<String, String>, // 虚拟名 -> 真实 bucket
     cors_config: HashMap<String, Option<cors::CorsConfig>>,
+    spa: HashMap<String, bool>,
 }
 
 #[tokio::main]
@@ -47,6 +48,7 @@ async fn main() -> anyhow::Result<()> {
     let cache = Arc::new(RwLock::new(AppCache {
         whitelist: HashMap::new(),
         cors_config: HashMap::new(),
+        spa: HashMap::new(),
     }));
     
     // 初始化缓存（同步拉取一次）
@@ -119,21 +121,18 @@ async fn proxy_handler(
     if bucket.is_empty() {
         return Err(ProxyError::InvalidPath("Bucket not found in host".to_string()));
     }
-    let path = uri.path();
-    let object_key = {
-        let mut key = path.trim_start_matches('/').to_string();
-        if key.is_empty() || key.ends_with('/') {
-            key.push_str("index.html");
-        }
-        key
+    let (real_bucket, cors_config, spa_enabled) = {
+        let cache = state.cache.read().await;
+        (
+            cache.whitelist.get(bucket).cloned(),
+            cache.cors_config.get(bucket).cloned().unwrap_or(None),
+            cache.spa.get(bucket).copied().unwrap_or(false),
+        )
     };
+    let object_key = resolve_object_key(uri.path(), spa_enabled);
     info!("Proxy request: bucket={}, key={}", bucket, object_key);
     
     // 检查 bucket 是否在白名单中
-    let real_bucket = {
-        let cache = state.cache.read().await;
-        cache.whitelist.get(bucket).cloned()
-    };
     let real_bucket = match real_bucket {
         Some(b) if !b.is_empty() => b,
         _ => {
@@ -141,13 +140,7 @@ async fn proxy_handler(
             return Err(ProxyError::UnauthorizedBucket(bucket.to_string()));
         }
     };
-    
-    // Get CORS configuration
-    let cors_config = {
-        let cache = state.cache.read().await;
-        cache.cors_config.get(bucket).cloned().unwrap_or(None)
-    };
-    
+
     // Get object from S3
     let s3_response = state.s3_client.get_object(&real_bucket, &object_key).await?;
     
@@ -206,6 +199,31 @@ async fn handle_options() -> impl IntoResponse {
     StatusCode::OK
 }
 
+fn resolve_object_key(path: &str, spa_enabled: bool) -> String {
+    let trimmed_path = path.trim_start_matches('/');
+
+    if trimmed_path.is_empty() {
+        return "index.html".to_string();
+    }
+
+    if spa_enabled && !has_file_extension(trimmed_path) {
+        return "index.html".to_string();
+    }
+
+    let mut key = trimmed_path.to_string();
+    if key.ends_with('/') {
+        key.push_str("index.html");
+    }
+    key
+}
+
+fn has_file_extension(path: &str) -> bool {
+    path.rsplit('/')
+        .next()
+        .map(|segment| segment.contains('.'))
+        .unwrap_or(false)
+}
+
 async fn refresh_cache(kv_client: &KvClient, cache: &Arc<RwLock<AppCache>>) -> Result<(), anyhow::Error> {
     // 读取 whitelist
     let whitelist_value = kv_client.get_kv_value("whitelist").await.ok().flatten();
@@ -229,8 +247,17 @@ async fn refresh_cache(kv_client: &KvClient, cache: &Arc<RwLock<AppCache>>) -> R
             }
         }
     }
+    // 读取 spa
+    let spa_value = kv_client.get_kv_value("spa").await.ok().flatten();
+    let mut spa = HashMap::new();
+    if let Some(val) = spa_value {
+        if let Ok(map) = serde_json::from_str::<HashMap<String, bool>>(&val) {
+            spa = map;
+        }
+    }
     let mut cache_guard = cache.write().await;
     cache_guard.whitelist = whitelist;
     cache_guard.cors_config = cors_config;
+    cache_guard.spa = spa;
     Ok(())
 }

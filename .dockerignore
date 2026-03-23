@@ -1,0 +1,10 @@
+.git
+.github
+.env
+target
+
+Dockerfile*
+README.md
+
+.DS_Store
+*.log

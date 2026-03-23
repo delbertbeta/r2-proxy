@@ -57,12 +57,28 @@ whitelist:another-bucket = false
 }
 ```
 
+### SPA 配置
+
+在 KV 中存储 SPA 配置，键为 `spa`，值为 JSON 对象，格式如下：
+
+```json
+{
+  "foo": true,
+  "@": false
+}
+```
+
+- key 为映射前的虚拟 bucket 名
+- value 为 `true` 时，该域名开启 SPA 模式
+- 开启后，如果请求路径没有文件名后缀，则直接回源根目录 `index.html`
+
 ## Bucket Mapping
 
 - 访问 mybucket.delbertbeta.life/path 代表虚拟 bucket "mybucket"，访问 delbertbeta.life 代表虚拟 bucket "@"
 - 实际访问的 S3 bucket 由 KV 中 whitelist 的 value 决定。例如：
   - `whitelist` = `[["foo", "real-bucket-name"], ["@", "default-bucket"]]`，则 foo.delbertbeta.life 代理到 S3 的 real-bucket-name，delbertbeta.life 代理到 default-bucket
 - CORS 配置由 KV 中 cors 的 value 决定，格式为 `{ "bucketname": { ...CORS配置... } }`
+- SPA 配置由 KV 中 spa 的 value 决定，格式为 `{ "bucketname": true }`
 - 如果没有配置或 value 为空，则拒绝访问
 
 ## API Usage
