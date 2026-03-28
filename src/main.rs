@@ -1,5 +1,5 @@
 use axum::{
-    http::{Method, StatusCode, Uri},
+    http::{HeaderMap, Method, StatusCode, Uri},
     response::{IntoResponse, Response},
     routing::{get, options},
     Router,
@@ -175,11 +175,7 @@ async fn proxy_handler(
             axum::http::HeaderValue::from_str(&last_modified).unwrap(),
         );
     }
-    // Set Cache-Control: public, max-age=7200 (120 min)
-    response.headers_mut().insert(
-        axum::http::header::CACHE_CONTROL,
-        axum::http::HeaderValue::from_static("public, max-age=7200"),
-    );
+    apply_cache_control(response.headers_mut(), &object_key);
     
     // Set custom server header
     response.headers_mut().insert(
@@ -222,6 +218,53 @@ fn has_file_extension(path: &str) -> bool {
         .next()
         .map(|segment| segment.contains('.'))
         .unwrap_or(false)
+}
+
+fn apply_cache_control(headers: &mut HeaderMap, object_key: &str) {
+    if object_key == "index.html" || object_key.ends_with("/index.html") {
+        return;
+    }
+
+    headers.insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("public, max-age=31536000, immutable"),
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::{header::CACHE_CONTROL, HeaderMap};
+
+    #[test]
+    fn non_index_assets_get_cache_control() {
+        let mut headers = HeaderMap::new();
+
+        apply_cache_control(&mut headers, "assets/app.js");
+
+        assert_eq!(
+            headers.get(CACHE_CONTROL).unwrap(),
+            "public, max-age=31536000, immutable"
+        );
+    }
+
+    #[test]
+    fn index_html_does_not_get_cache_control() {
+        let mut headers = HeaderMap::new();
+
+        apply_cache_control(&mut headers, "index.html");
+
+        assert!(headers.get(CACHE_CONTROL).is_none());
+    }
+
+    #[test]
+    fn nested_index_html_does_not_get_cache_control() {
+        let mut headers = HeaderMap::new();
+
+        apply_cache_control(&mut headers, "docs/index.html");
+
+        assert!(headers.get(CACHE_CONTROL).is_none());
+    }
 }
 
 async fn refresh_cache(kv_client: &KvClient, cache: &Arc<RwLock<AppCache>>) -> Result<(), anyhow::Error> {
