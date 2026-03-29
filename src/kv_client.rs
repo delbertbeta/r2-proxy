@@ -13,10 +13,11 @@ pub struct KvClient {
 impl KvClient {
     pub fn new(account_id: &str, api_token: &str) -> Result<Self, ProxyError> {
         // Get namespace_id from env
-        let namespace_id = std::env::var("CLOUDFLARE_KV_NAMESPACE_ID")
-            .map_err(|_| ProxyError::ConfigError(crate::config::ConfigError::MissingEnvVar(
-                "CLOUDFLARE_KV_NAMESPACE_ID".to_string()
-            )))?;
+        let namespace_id = std::env::var("CLOUDFLARE_KV_NAMESPACE_ID").map_err(|_| {
+            ProxyError::ConfigError(crate::config::ConfigError::MissingEnvVar(
+                "CLOUDFLARE_KV_NAMESPACE_ID".to_string(),
+            ))
+        })?;
 
         Ok(Self {
             client: Client::new(),
@@ -33,7 +34,8 @@ impl KvClient {
         );
         info!(kv_key = key, "fetching kv value");
 
-        let response = self.client
+        let response = self
+            .client
             .get(&url)
             .header("Authorization", format!("Bearer {}", self.api_token))
             .send()
@@ -42,7 +44,9 @@ impl KvClient {
 
         if response.status().is_success() {
             info!(kv_key = key, status = %response.status(), "kv value fetched");
-            let text = response.text().await
+            let text = response
+                .text()
+                .await
                 .map_err(|e| ProxyError::KvError(format!("Read response failed: {}", e)))?;
             Ok(Some(text))
         } else if response.status() == reqwest::StatusCode::NOT_FOUND {
@@ -51,11 +55,14 @@ impl KvClient {
         } else {
             let status = response.status();
             let text = response.text().await.unwrap_or_default();
-            Err(ProxyError::KvError(format!("KV API error: {} - {}", status, text)))
+            Err(ProxyError::KvError(format!(
+                "KV API error: {} - {}",
+                status, text
+            )))
         }
     }
 
     pub fn namespace_id(&self) -> &str {
         &self.namespace_id
     }
-} 
+}

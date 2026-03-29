@@ -1,14 +1,17 @@
+use async_stream::try_stream;
 use axum::{
+    body::{Body, Bytes},
     http::{HeaderMap, Method, StatusCode, Uri},
     response::{IntoResponse, Response},
     routing::{get, options},
     Router,
 };
+use serde_json;
 use std::collections::HashMap;
 use std::env;
+use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use serde_json;
 use tokio::sync::RwLock;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{error, info, warn};
@@ -18,11 +21,13 @@ mod config;
 mod cors;
 mod errors;
 mod kv_client;
+mod local_cache;
 mod s3_client;
 
 use config::Config;
 use errors::ProxyError;
 use kv_client::KvClient;
+use local_cache::{CacheStatus, LocalCache, PendingCacheWrite};
 use s3_client::S3Client;
 
 struct AppCache {
@@ -34,29 +39,35 @@ struct AppCache {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     init_logging();
-    
+
     // Load config
     dotenv::dotenv().ok();
     let config = Config::from_env()?;
-    
+
     info!(port = config.port, "starting r2 proxy server");
-    
+
     // Initialize client
     let kv_client = KvClient::new(&config.cloudflare_account_id, &config.cloudflare_api_token)?;
-    let s3_client = S3Client::new(&config.r2_endpoint, &config.r2_access_key_id, &config.r2_secret_access_key).await?;
+    let s3_client = S3Client::new(
+        &config.r2_endpoint,
+        &config.r2_access_key_id,
+        &config.r2_secret_access_key,
+    )
+    .await?;
+    let local_cache = LocalCache::new(config.local_cache.clone()).await;
     info!(
         cloudflare_account_id = %config.cloudflare_account_id,
         cloudflare_kv_namespace_id = %kv_client.namespace_id(),
         "clients initialized"
     );
-    
+
     // Initialize cache
     let cache = Arc::new(RwLock::new(AppCache {
         whitelist: HashMap::new(),
         cors_config: HashMap::new(),
         spa: HashMap::new(),
     }));
-    
+
     // 初始化缓存（同步拉取一次）
     refresh_cache(&kv_client, &cache).await?;
     info!("initial cache refresh completed");
@@ -66,7 +77,7 @@ async fn main() -> anyhow::Result<()> {
         .allow_methods([Method::GET, Method::OPTIONS])
         .allow_origin(Any)
         .allow_headers(Any);
-    
+
     // Create routes
     let app = Router::new()
         .route("/", get(proxy_handler))
@@ -76,9 +87,10 @@ async fn main() -> anyhow::Result<()> {
         .layer(cors)
         .with_state(AppState {
             s3_client,
+            local_cache,
             cache: cache.clone(),
         });
-    
+
     // Start refresh task
     let kv_client_clone = kv_client.clone();
     let cache_clone = cache.clone();
@@ -97,13 +109,14 @@ async fn main() -> anyhow::Result<()> {
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
-    
+
     Ok(())
 }
 
 #[derive(Clone)]
 struct AppState {
     s3_client: S3Client,
+    local_cache: LocalCache,
     cache: Arc<RwLock<AppCache>>,
 }
 
@@ -115,7 +128,9 @@ async fn proxy_handler(
     let bucket = resolve_virtual_bucket(&host);
     info!(host = %host, path = %uri.path(), virtual_bucket = bucket, "incoming request");
     if bucket.is_empty() {
-        return Err(ProxyError::InvalidPath("Bucket not found in host".to_string()));
+        return Err(ProxyError::InvalidPath(
+            "Bucket not found in host".to_string(),
+        ));
     }
     let (real_bucket, cors_config, spa_enabled) = {
         let cache = state.cache.read().await;
@@ -134,7 +149,7 @@ async fn proxy_handler(
         spa_enabled,
         "resolved request routing"
     );
-    
+
     // 检查 bucket 是否在白名单中
     let real_bucket = match real_bucket {
         Some(b) if !b.is_empty() => {
@@ -149,7 +164,12 @@ async fn proxy_handler(
         _ => {
             let known_buckets = {
                 let cache = state.cache.read().await;
-                cache.whitelist.keys().cloned().collect::<Vec<_>>().join(",")
+                cache
+                    .whitelist
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(",")
             };
             warn!(
                 host = %host,
@@ -163,48 +183,83 @@ async fn proxy_handler(
         }
     };
 
-    // Get object from S3
-    let s3_response = state.s3_client.get_object(&real_bucket, &object_key).await?;
-    
+    let (cache_status, body, cached_headers) =
+        match state.local_cache.get(&real_bucket, &object_key).await? {
+            (CacheStatus::Hit, Some(cached_response)) => (
+                CacheStatus::Hit,
+                Body::from(cached_response.body),
+                cached_response.headers,
+            ),
+            (lookup_status, _) => {
+                let s3_response = state
+                    .s3_client
+                    .get_object(&real_bucket, &object_key)
+                    .await?;
+                let (response_status, pending_write) =
+                    if matches!(lookup_status, CacheStatus::Disabled | CacheStatus::Bypass) {
+                        (lookup_status, None)
+                    } else {
+                        state
+                            .local_cache
+                            .prepare_stream_store(
+                                &real_bucket,
+                                &object_key,
+                                s3_response.headers.content_length,
+                                s3_response.headers.clone(),
+                            )
+                            .await?
+                    };
+
+                (
+                    response_status,
+                    Body::from_stream(stream_origin_body(s3_response.body, pending_write)),
+                    s3_response.headers,
+                )
+            }
+        };
+
     // Build response
-    let mut response = Response::new(s3_response.body);
-    
+    let mut response = Response::new(body);
+
     // Set status code
     *response.status_mut() = StatusCode::OK;
-    
+
     // Set content type
-    if let Some(content_type) = s3_response.content_type {
+    if let Some(content_type) = cached_headers.content_type {
+        let content_type = axum::http::HeaderValue::from_str(&content_type)
+            .unwrap_or_else(|_| axum::http::HeaderValue::from_static("application/octet-stream"));
         response.headers_mut().insert("content-type", content_type);
     }
     // Set content length
-    if let Some(content_length) = s3_response.content_length {
+    if let Some(content_length) = cached_headers.content_length {
         response.headers_mut().insert(
             axum::http::header::CONTENT_LENGTH,
             axum::http::HeaderValue::from_str(&content_length.to_string()).unwrap(),
         );
     }
     // Set ETag
-    if let Some(etag) = s3_response.etag {
+    if let Some(etag) = cached_headers.etag {
         response.headers_mut().insert(
             axum::http::header::ETAG,
             axum::http::HeaderValue::from_str(&etag).unwrap(),
         );
     }
     // Set Last-Modified
-    if let Some(last_modified) = s3_response.last_modified {
+    if let Some(last_modified) = cached_headers.last_modified {
         response.headers_mut().insert(
             axum::http::header::LAST_MODIFIED,
             axum::http::HeaderValue::from_str(&last_modified).unwrap(),
         );
     }
     apply_cache_control(response.headers_mut(), &object_key);
-    
+    apply_cache_status_header(response.headers_mut(), cache_status);
+
     // Set custom server header
     response.headers_mut().insert(
         "X-Served-By",
         axum::http::HeaderValue::from_static("r2-proxy"),
     );
-    
+
     // Set CORS headers
     if let Some(cors) = cors_config {
         cors.apply_headers(response.headers_mut());
@@ -218,7 +273,7 @@ async fn proxy_handler(
         status = %StatusCode::OK,
         "request served successfully"
     );
-    
+
     Ok(response)
 }
 
@@ -302,6 +357,57 @@ fn apply_cache_control(headers: &mut HeaderMap, object_key: &str) {
     );
 }
 
+fn apply_cache_status_header(headers: &mut HeaderMap, status: CacheStatus) {
+    headers.insert(
+        "X-R2-Proxy-Cached",
+        axum::http::HeaderValue::from_static(status.header_value()),
+    );
+}
+
+fn stream_origin_body(
+    upstream_body: aws_sdk_s3::primitives::ByteStream,
+    pending_write: Option<PendingCacheWrite>,
+) -> impl futures_util::Stream<Item = Result<Bytes, io::Error>> {
+    try_stream! {
+        let mut upstream_body = upstream_body;
+        let mut pending_write = pending_write;
+
+        loop {
+            let next_chunk = match upstream_body.try_next().await {
+                Ok(next_chunk) => next_chunk,
+                Err(error) => {
+                    if let Some(writer) = pending_write.take() {
+                        writer.abort().await;
+                    }
+                    Err(io::Error::other(format!("failed to read s3 stream: {error}")))?;
+                    unreachable!();
+                }
+            };
+
+            let Some(chunk) = next_chunk else {
+                break;
+            };
+
+            if let Some(writer) = pending_write.as_mut() {
+                if let Err(error) = writer.write_chunk(chunk.as_ref()).await {
+                    warn!(error = %error, "stream cache write failed, disabling cache fill for current request");
+                    if let Some(writer) = pending_write.take() {
+                        writer.abort().await;
+                    }
+                }
+            }
+
+            yield chunk;
+        }
+
+        if let Some(writer) = pending_write {
+            if let Err(error) = writer.commit().await {
+                warn!(error = %error, "stream cache commit failed");
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -314,7 +420,10 @@ mod tests {
 
     #[test]
     fn custom_log_filter_is_preserved() {
-        assert_eq!(default_log_filter(Some("debug,hyper=warn")), "debug,hyper=warn");
+        assert_eq!(
+            default_log_filter(Some("debug,hyper=warn")),
+            "debug,hyper=warn"
+        );
     }
 
     #[test]
@@ -371,9 +480,21 @@ mod tests {
 
         assert!(headers.get(CACHE_CONTROL).is_none());
     }
+
+    #[test]
+    fn applies_r2_proxy_cached_header() {
+        let mut headers = HeaderMap::new();
+
+        apply_cache_status_header(&mut headers, CacheStatus::Hit);
+
+        assert_eq!(headers.get("x-r2-proxy-cached").unwrap(), "HIT");
+    }
 }
 
-async fn refresh_cache(kv_client: &KvClient, cache: &Arc<RwLock<AppCache>>) -> Result<(), anyhow::Error> {
+async fn refresh_cache(
+    kv_client: &KvClient,
+    cache: &Arc<RwLock<AppCache>>,
+) -> Result<(), anyhow::Error> {
     info!("refreshing cache from cloudflare kv");
     // 读取 whitelist
     let whitelist_value = kv_client.get_kv_value("whitelist").await?;

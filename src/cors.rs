@@ -30,29 +30,38 @@ impl CorsConfig {
         if let Some(origin) = self.allowed_origins.first() {
             headers.insert("access-control-allow-origin", origin.parse().unwrap());
         }
-        
+
         // Access-Control-Allow-Methods
         let methods = self.allowed_methods.join(", ");
         headers.insert("access-control-allow-methods", methods.parse().unwrap());
-        
+
         // Access-Control-Allow-Headers
         let allowed_headers = self.allowed_headers.join(", ");
-        headers.insert("access-control-allow-headers", allowed_headers.parse().unwrap());
-        
+        headers.insert(
+            "access-control-allow-headers",
+            allowed_headers.parse().unwrap(),
+        );
+
         // Access-Control-Expose-Headers
         if !self.expose_headers.is_empty() {
             let expose_headers = self.expose_headers.join(", ");
-            headers.insert("access-control-expose-headers", expose_headers.parse().unwrap());
+            headers.insert(
+                "access-control-expose-headers",
+                expose_headers.parse().unwrap(),
+            );
         }
-        
+
         // Access-Control-Max-Age
         if let Some(max_age) = self.max_age {
-            headers.insert("access-control-max-age", max_age.to_string().parse().unwrap());
+            headers.insert(
+                "access-control-max-age",
+                max_age.to_string().parse().unwrap(),
+            );
         }
-        
+
         // Access-Control-Allow-Credentials
         if self.allow_credentials {
             headers.insert("access-control-allow-credentials", "true".parse().unwrap());
         }
     }
-} 
+}

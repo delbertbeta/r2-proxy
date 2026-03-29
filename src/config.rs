@@ -7,6 +7,17 @@ pub enum ConfigError {
     MissingEnvVar(String),
     #[error("Port parse failed: {0}")]
     InvalidPort(String),
+    #[error("Invalid cache size: {0}")]
+    InvalidCacheSize(String),
+}
+
+#[derive(Clone, Debug)]
+pub struct LocalCacheConfig {
+    pub enabled: bool,
+    pub max_size_bytes: u64,
+    pub directory: String,
+    pub redis_url: String,
+    pub redis_key_prefix: String,
 }
 
 #[derive(Clone, Debug)]
@@ -17,10 +28,21 @@ pub struct Config {
     pub r2_endpoint: String,
     pub r2_access_key_id: String,
     pub r2_secret_access_key: String,
+    pub local_cache: Option<LocalCacheConfig>,
 }
 
 impl Config {
     pub fn from_env() -> Result<Self, ConfigError> {
+        let local_cache_enabled = env::var("LOCAL_CACHE_ENABLED")
+            .ok()
+            .map(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false);
+
         Ok(Self {
             port: env::var("PORT")
                 .unwrap_or_else(|_| "3000".to_string())
@@ -36,6 +58,93 @@ impl Config {
                 .map_err(|_| ConfigError::MissingEnvVar("R2_ACCESS_KEY_ID".to_string()))?,
             r2_secret_access_key: env::var("R2_SECRET_ACCESS_KEY")
                 .map_err(|_| ConfigError::MissingEnvVar("R2_SECRET_ACCESS_KEY".to_string()))?,
+            local_cache: if local_cache_enabled {
+                Some(LocalCacheConfig {
+                    enabled: true,
+                    max_size_bytes: parse_size(&env::var("LOCAL_CACHE_MAX_SIZE").map_err(
+                        |_| ConfigError::MissingEnvVar("LOCAL_CACHE_MAX_SIZE".to_string()),
+                    )?)?,
+                    directory: env::var("LOCAL_CACHE_DIR")
+                        .map_err(|_| ConfigError::MissingEnvVar("LOCAL_CACHE_DIR".to_string()))?,
+                    redis_url: env::var("REDIS_URL")
+                        .map_err(|_| ConfigError::MissingEnvVar("REDIS_URL".to_string()))?,
+                    redis_key_prefix: env::var("REDIS_KEY_PREFIX")
+                        .unwrap_or_else(|_| "r2proxy".to_string()),
+                })
+            } else {
+                None
+            },
         })
     }
-} 
+}
+
+fn parse_size(input: &str) -> Result<u64, ConfigError> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err(ConfigError::InvalidCacheSize(input.to_string()));
+    }
+
+    let split_index = trimmed
+        .find(|ch: char| !ch.is_ascii_digit())
+        .unwrap_or(trimmed.len());
+    let (digits, suffix) = trimmed.split_at(split_index);
+
+    let base = digits
+        .parse::<u64>()
+        .map_err(|_| ConfigError::InvalidCacheSize(input.to_string()))?;
+
+    let multiplier = match suffix.trim().to_ascii_uppercase().as_str() {
+        "" | "B" => 1,
+        "K" | "KB" => 1024,
+        "M" | "MB" => 1024 * 1024,
+        "G" | "GB" => 1024 * 1024 * 1024,
+        _ => return Err(ConfigError::InvalidCacheSize(input.to_string())),
+    };
+
+    base.checked_mul(multiplier)
+        .ok_or_else(|| ConfigError::InvalidCacheSize(input.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn set_base_env() {
+        unsafe {
+            env::set_var("PORT", "3000");
+            env::set_var("CLOUDFLARE_ACCOUNT_ID", "account");
+            env::set_var("CLOUDFLARE_API_TOKEN", "token");
+            env::set_var("R2_ENDPOINT", "https://example.r2.cloudflarestorage.com");
+            env::set_var("R2_ACCESS_KEY_ID", "key");
+            env::set_var("R2_SECRET_ACCESS_KEY", "secret");
+        }
+    }
+
+    #[test]
+    fn parses_human_readable_local_cache_size() {
+        assert_eq!(parse_size("512M").unwrap(), 512 * 1024 * 1024);
+        assert_eq!(parse_size("1G").unwrap(), 1024 * 1024 * 1024);
+        assert_eq!(parse_size("1024K").unwrap(), 1024 * 1024);
+    }
+
+    #[test]
+    fn config_reads_optional_local_cache_and_redis_settings() {
+        set_base_env();
+        unsafe {
+            env::set_var("LOCAL_CACHE_ENABLED", "true");
+            env::set_var("LOCAL_CACHE_MAX_SIZE", "512M");
+            env::set_var("LOCAL_CACHE_DIR", "/tmp/r2-proxy");
+            env::set_var("REDIS_URL", "redis://127.0.0.1:6379");
+            env::set_var("REDIS_KEY_PREFIX", "custom");
+        }
+
+        let config = Config::from_env().unwrap();
+        let local_cache = config.local_cache.expect("local cache config");
+
+        assert!(local_cache.enabled);
+        assert_eq!(local_cache.max_size_bytes, 512 * 1024 * 1024);
+        assert_eq!(local_cache.directory, "/tmp/r2-proxy");
+        assert_eq!(local_cache.redis_url, "redis://127.0.0.1:6379");
+        assert_eq!(local_cache.redis_key_prefix, "custom");
+    }
+}

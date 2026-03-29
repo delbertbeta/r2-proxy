@@ -1,16 +1,13 @@
 use crate::errors::ProxyError;
+use crate::local_cache::CachedHeaders;
 use aws_config::BehaviorVersion;
-use aws_sdk_s3::{ Client, Config};
-use axum::body::Body;
+use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::{Client, Config};
 use tracing::{info, warn};
-use tokio_util::io::ReaderStream;
 
 pub struct S3Response {
-    pub body: Body,
-    pub content_type: Option<axum::http::HeaderValue>,
-    pub content_length: Option<u64>,
-    pub etag: Option<String>,
-    pub last_modified: Option<String>,
+    pub body: ByteStream,
+    pub headers: CachedHeaders,
 }
 
 #[derive(Clone)]
@@ -60,9 +57,11 @@ impl S3Client {
 
         // 获取元数据
         let content_type = output.content_type().map(|ct| {
-            axum::http::HeaderValue::from_str(ct).unwrap_or_else(|_| {
-                axum::http::HeaderValue::from_static("application/octet-stream")
-            })
+            if ct.is_empty() {
+                "application/octet-stream".to_string()
+            } else {
+                ct.to_string()
+            }
         });
 
         let content_length = output.content_length().map(|len| len as u64);
@@ -77,17 +76,14 @@ impl S3Client {
             "s3 object fetched successfully"
         );
 
-        // 流式转发 S3 响应体
-        let s3_body = output.body.into_async_read();
-        let stream = ReaderStream::new(s3_body);
-        let body = Body::from_stream(stream);
-
         Ok(S3Response {
-            body,
-            content_type,
-            content_length,
-            etag,
-            last_modified,
+            body: output.body,
+            headers: CachedHeaders {
+                content_type,
+                content_length,
+                etag,
+                last_modified,
+            },
         })
     }
 }

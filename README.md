@@ -27,7 +27,20 @@ CLOUDFLARE_KV_NAMESPACE_ID=your_kv_namespace_id
 R2_ENDPOINT=https://your-account-id.r2.cloudflarestorage.com
 R2_ACCESS_KEY_ID=your_r2_access_key_id
 R2_SECRET_ACCESS_KEY=your_r2_secret_access_key
+
+# 本地磁盘缓存配置（可选）
+LOCAL_CACHE_ENABLED=true
+LOCAL_CACHE_MAX_SIZE=1G
+LOCAL_CACHE_DIR=/var/cache/r2-proxy
+REDIS_URL=redis://127.0.0.1:6379
+REDIS_KEY_PREFIX=r2proxy
 ```
+
+- `LOCAL_CACHE_MAX_SIZE` 支持自然语言容量，例如 `512M`、`1G`、`1024K`
+- 任何以 `index.html` 结尾的对象路径都不会进入本地缓存
+- 每个响应都会带 `X-R2-Proxy-Cached`，取值为 `HIT`、`MISS`、`BYPASS`、`DISABLED`
+- 本地磁盘只保存响应体，缓存元数据、响应头和 LFU 索引存放在 Redis 中
+- 如果 Redis 不可用，本地缓存会自动降级为禁用状态，请求继续回源
 
 ## Cloudflare KV 配置
 
