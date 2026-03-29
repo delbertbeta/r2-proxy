@@ -80,6 +80,7 @@ struct PendingCacheWriteInner {
     final_path: PathBuf,
     file: Option<File>,
     body_size: u64,
+    written_size: u64,
     headers: CachedHeaders,
 }
 
@@ -304,6 +305,7 @@ impl LocalCache {
                     final_path,
                     file: Some(file),
                     body_size,
+                    written_size: 0,
                     headers,
                 }),
             }),
@@ -472,6 +474,10 @@ pub fn can_stream_store(content_length: Option<u64>, max_size_bytes: u64) -> boo
     matches!(content_length, Some(length) if length <= max_size_bytes)
 }
 
+fn should_commit_after_write(written_size: u64, body_size: u64) -> bool {
+    written_size >= body_size
+}
+
 fn build_cache_key(bucket: &str, object_key: &str) -> String {
     let digest = md5::compute(format!("{bucket}:{object_key}"));
     format!("{digest:x}.bin")
@@ -486,21 +492,44 @@ fn unix_timestamp() -> u64 {
 
 impl PendingCacheWrite {
     pub async fn write_chunk(&mut self, chunk: &[u8]) -> Result<(), ProxyError> {
-        let Some(inner) = self.inner.as_mut() else {
-            return Ok(());
+        let should_commit = {
+            let Some(inner) = self.inner.as_mut() else {
+                return Ok(());
+            };
+
+            let file = inner.file.as_mut().expect("pending cache file must exist");
+            file.write_all(chunk).await.map_err(|error| {
+                ProxyError::InternalError(format!("failed to write cache chunk: {error}"))
+            })?;
+            inner.written_size = inner.written_size.saturating_add(chunk.len() as u64);
+            should_commit_after_write(inner.written_size, inner.body_size)
         };
 
-        let file = inner.file.as_mut().expect("pending cache file must exist");
-        file.write_all(chunk).await.map_err(|error| {
-            ProxyError::InternalError(format!("failed to write cache chunk: {error}"))
-        })
+        if should_commit {
+            if let Some(inner) = self.inner.take() {
+                Self::commit_inner(inner).await?;
+            }
+        }
+
+        Ok(())
     }
 
     pub async fn commit(mut self) -> Result<(), ProxyError> {
-        let Some(mut inner) = self.inner.take() else {
+        let Some(inner) = self.inner.take() else {
             return Ok(());
         };
 
+        Self::commit_inner(inner).await
+    }
+
+    pub async fn abort(mut self) {
+        if let Some(mut inner) = self.inner.take() {
+            inner.file.take();
+            let _ = fs::remove_file(&inner.temp_path).await;
+        }
+    }
+
+    async fn commit_inner(mut inner: PendingCacheWriteInner) -> Result<(), ProxyError> {
         let file = inner.file.as_mut().expect("pending cache file must exist");
         file.flush().await.map_err(|error| {
             ProxyError::InternalError(format!("failed to flush cache file: {error}"))
@@ -562,13 +591,6 @@ impl PendingCacheWrite {
 
         Ok(())
     }
-
-    pub async fn abort(mut self) {
-        if let Some(mut inner) = self.inner.take() {
-            inner.file.take();
-            let _ = fs::remove_file(&inner.temp_path).await;
-        }
-    }
 }
 
 impl Drop for PendingCacheWriteInner {
@@ -619,6 +641,13 @@ mod tests {
         assert!(!can_stream_store(Some(4096), 2048));
     }
 
+    #[test]
+    fn commit_boundary_is_last_written_byte() {
+        assert!(!should_commit_after_write(1023, 1024));
+        assert!(should_commit_after_write(1024, 1024));
+        assert!(should_commit_after_write(2048, 1024));
+    }
+
     #[tokio::test]
     async fn dropping_pending_cache_write_removes_temp_file() {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -641,6 +670,7 @@ mod tests {
                 final_path: final_path.clone(),
                 file: Some(file),
                 body_size: 1,
+                written_size: 0,
                 headers: CachedHeaders::default(),
             }),
         };
