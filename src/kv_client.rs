@@ -1,5 +1,6 @@
 use crate::errors::ProxyError;
 use reqwest::Client;
+use tracing::{info, warn};
 
 #[derive(Clone)]
 pub struct KvClient {
@@ -30,6 +31,7 @@ impl KvClient {
             "https://api.cloudflare.com/client/v4/accounts/{}/storage/kv/namespaces/{}/values/{}",
             self.account_id, self.namespace_id, key
         );
+        info!(kv_key = key, "fetching kv value");
 
         let response = self.client
             .get(&url)
@@ -39,15 +41,21 @@ impl KvClient {
             .map_err(|e| ProxyError::KvError(format!("KV request failed: {}", e)))?;
 
         if response.status().is_success() {
+            info!(kv_key = key, status = %response.status(), "kv value fetched");
             let text = response.text().await
                 .map_err(|e| ProxyError::KvError(format!("Read response failed: {}", e)))?;
             Ok(Some(text))
         } else if response.status() == reqwest::StatusCode::NOT_FOUND {
+            warn!(kv_key = key, "kv value not found");
             Ok(None)
         } else {
             let status = response.status();
             let text = response.text().await.unwrap_or_default();
             Err(ProxyError::KvError(format!("KV API error: {} - {}", status, text)))
         }
+    }
+
+    pub fn namespace_id(&self) -> &str {
+        &self.namespace_id
     }
 } 

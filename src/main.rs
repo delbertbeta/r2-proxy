@@ -4,13 +4,15 @@ use axum::{
     routing::{get, options},
     Router,
 };
-use std::net::SocketAddr;
-use tower_http::cors::{Any, CorsLayer};
-use tracing::{info, warn};
 use std::collections::HashMap;
+use std::env;
+use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 use serde_json;
+use tokio::sync::RwLock;
+use tower_http::cors::{Any, CorsLayer};
+use tracing::{error, info, warn};
+use tracing_subscriber::EnvFilter;
 
 mod config;
 mod cors;
@@ -31,18 +33,22 @@ struct AppCache {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Initialize logger
-    tracing_subscriber::fmt::init();
+    init_logging();
     
     // Load config
     dotenv::dotenv().ok();
     let config = Config::from_env()?;
     
-    info!("Start R2 proxy server, listen port: {}", config.port);
+    info!(port = config.port, "starting r2 proxy server");
     
     // Initialize client
     let kv_client = KvClient::new(&config.cloudflare_account_id, &config.cloudflare_api_token)?;
     let s3_client = S3Client::new(&config.r2_endpoint, &config.r2_access_key_id, &config.r2_secret_access_key).await?;
+    info!(
+        cloudflare_account_id = %config.cloudflare_account_id,
+        cloudflare_kv_namespace_id = %kv_client.namespace_id(),
+        "clients initialized"
+    );
     
     // Initialize cache
     let cache = Arc::new(RwLock::new(AppCache {
@@ -53,6 +59,7 @@ async fn main() -> anyhow::Result<()> {
     
     // 初始化缓存（同步拉取一次）
     refresh_cache(&kv_client, &cache).await?;
+    info!("initial cache refresh completed");
 
     // Create CORS middleware
     let cors = CorsLayer::new()
@@ -79,14 +86,14 @@ async fn main() -> anyhow::Result<()> {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(600)).await;
             if let Err(e) = refresh_cache(&kv_client_clone, &cache_clone).await {
-                tracing::error!("Refresh cache failed: {}", e);
+                error!(error = %e, "cache refresh failed");
             }
         }
     });
 
     // Start server
     let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
-    info!("Server started at http://{}", addr);
+    info!(address = %addr, "server listening");
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
@@ -105,19 +112,8 @@ async fn proxy_handler(
     axum::extract::State(state): axum::extract::State<AppState>,
     axum::extract::Host(host): axum::extract::Host,
 ) -> Result<Response, ProxyError> {
-    // 解析 bucket 从 host
-    // 例如 bucket.delbertbeta.life 或 delbertbeta.life
-    let bucket = if let Some((prefix, rest)) = host.split_once('.') {
-        if rest == "delbertbeta.life" {
-            prefix
-        } else {
-            "@"
-        }
-    } else if host == "delbertbeta.life" {
-        "@"
-    } else {
-        "@"
-    };
+    let bucket = resolve_virtual_bucket(&host);
+    info!(host = %host, path = %uri.path(), virtual_bucket = bucket, "incoming request");
     if bucket.is_empty() {
         return Err(ProxyError::InvalidPath("Bucket not found in host".to_string()));
     }
@@ -130,13 +126,39 @@ async fn proxy_handler(
         )
     };
     let object_key = resolve_object_key(uri.path(), spa_enabled);
-    info!("Proxy request: bucket={}, key={}", bucket, object_key);
+    info!(
+        host = %host,
+        path = %uri.path(),
+        virtual_bucket = bucket,
+        object_key = %object_key,
+        spa_enabled,
+        "resolved request routing"
+    );
     
     // 检查 bucket 是否在白名单中
     let real_bucket = match real_bucket {
-        Some(b) if !b.is_empty() => b,
+        Some(b) if !b.is_empty() => {
+            info!(
+                host = %host,
+                virtual_bucket = bucket,
+                real_bucket = %b,
+                "bucket authorized"
+            );
+            b
+        }
         _ => {
-            warn!("Access to unauthorized bucket denied: {}", bucket);
+            let known_buckets = {
+                let cache = state.cache.read().await;
+                cache.whitelist.keys().cloned().collect::<Vec<_>>().join(",")
+            };
+            warn!(
+                host = %host,
+                path = %uri.path(),
+                virtual_bucket = bucket,
+                object_key = %object_key,
+                known_virtual_buckets = %known_buckets,
+                "access to bucket denied because whitelist lookup failed"
+            );
             return Err(ProxyError::UnauthorizedBucket(bucket.to_string()));
         }
     };
@@ -187,12 +209,61 @@ async fn proxy_handler(
     if let Some(cors) = cors_config {
         cors.apply_headers(response.headers_mut());
     }
+
+    info!(
+        host = %host,
+        virtual_bucket = bucket,
+        real_bucket = %real_bucket,
+        object_key = %object_key,
+        status = %StatusCode::OK,
+        "request served successfully"
+    );
     
     Ok(response)
 }
 
 async fn handle_options() -> impl IntoResponse {
+    info!("handled preflight options request");
     StatusCode::OK
+}
+
+fn init_logging() {
+    let rust_log = env::var("RUST_LOG").ok();
+    let filter = default_log_filter(rust_log.as_deref());
+
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::new(filter))
+        .with_writer(std::io::stdout)
+        .with_ansi(false)
+        .init();
+}
+
+fn default_log_filter(value: Option<&str>) -> &str {
+    match value {
+        Some(v) if !v.trim().is_empty() => v,
+        _ => "info",
+    }
+}
+
+fn resolve_virtual_bucket(host: &str) -> &str {
+    if let Some((prefix, rest)) = host.split_once('.') {
+        if rest == "delbertbeta.life" {
+            return prefix;
+        }
+    } else if host == "delbertbeta.life" {
+        return "@";
+    }
+
+    "@"
+}
+
+fn preview_value(value: &str, max_chars: usize) -> String {
+    let preview: String = value.chars().take(max_chars).collect();
+    if value.chars().count() > max_chars {
+        format!("{preview}...")
+    } else {
+        preview
+    }
 }
 
 fn resolve_object_key(path: &str, spa_enabled: bool) -> String {
@@ -237,6 +308,41 @@ mod tests {
     use axum::http::{header::CACHE_CONTROL, HeaderMap};
 
     #[test]
+    fn default_log_filter_is_info() {
+        assert_eq!(default_log_filter(None), "info");
+    }
+
+    #[test]
+    fn custom_log_filter_is_preserved() {
+        assert_eq!(default_log_filter(Some("debug,hyper=warn")), "debug,hyper=warn");
+    }
+
+    #[test]
+    fn resolves_virtual_bucket_from_subdomain_host() {
+        assert_eq!(resolve_virtual_bucket("foo.delbertbeta.life"), "foo");
+    }
+
+    #[test]
+    fn resolves_virtual_bucket_from_root_domain_host() {
+        assert_eq!(resolve_virtual_bucket("delbertbeta.life"), "@");
+    }
+
+    #[test]
+    fn resolves_virtual_bucket_to_default_for_unknown_host() {
+        assert_eq!(resolve_virtual_bucket("example.com"), "@");
+    }
+
+    #[test]
+    fn preview_value_truncates_long_text() {
+        assert_eq!(preview_value("abcdef", 4), "abcd...");
+    }
+
+    #[test]
+    fn preview_value_keeps_short_text() {
+        assert_eq!(preview_value("abc", 4), "abc");
+    }
+
+    #[test]
     fn non_index_assets_get_cache_control() {
         let mut headers = HeaderMap::new();
 
@@ -268,39 +374,100 @@ mod tests {
 }
 
 async fn refresh_cache(kv_client: &KvClient, cache: &Arc<RwLock<AppCache>>) -> Result<(), anyhow::Error> {
+    info!("refreshing cache from cloudflare kv");
     // 读取 whitelist
-    let whitelist_value = kv_client.get_kv_value("whitelist").await.ok().flatten();
+    let whitelist_value = kv_client.get_kv_value("whitelist").await?;
     let mut whitelist = HashMap::new();
     if let Some(val) = whitelist_value {
-        if let Ok(list) = serde_json::from_str::<Vec<(String, String)>>(&val) {
-            for (prefix, bucket) in list {
-                if !prefix.trim().is_empty() && !bucket.trim().is_empty() {
-                    whitelist.insert(prefix.trim().to_string(), bucket.trim().to_string());
+        info!(
+            kv_key = "whitelist",
+            value_length = val.len(),
+            value_preview = %preview_value(&val, 200),
+            "loaded raw kv value"
+        );
+        match serde_json::from_str::<Vec<(String, String)>>(&val) {
+            Ok(list) => {
+                for (prefix, bucket) in list {
+                    if !prefix.trim().is_empty() && !bucket.trim().is_empty() {
+                        whitelist.insert(prefix.trim().to_string(), bucket.trim().to_string());
+                    }
                 }
             }
-        }
-    }
-    // 读取 cors
-    let cors_value = kv_client.get_kv_value("cors").await.ok().flatten();
-    let mut cors_config = HashMap::new();
-    if let Some(val) = cors_value {
-        if let Ok(map) = serde_json::from_str::<HashMap<String, cors::CorsConfig>>(&val) {
-            for (bucket, config) in map {
-                cors_config.insert(bucket, Some(config));
+            Err(error) => {
+                warn!(
+                    kv_key = "whitelist",
+                    parse_error = %error,
+                    value_preview = %preview_value(&val, 200),
+                    "failed to parse kv value"
+                );
             }
         }
+    } else {
+        warn!(kv_key = "whitelist", "kv value missing or empty");
+    }
+    // 读取 cors
+    let cors_value = kv_client.get_kv_value("cors").await?;
+    let mut cors_config = HashMap::new();
+    if let Some(val) = cors_value {
+        info!(
+            kv_key = "cors",
+            value_length = val.len(),
+            value_preview = %preview_value(&val, 200),
+            "loaded raw kv value"
+        );
+        match serde_json::from_str::<HashMap<String, cors::CorsConfig>>(&val) {
+            Ok(map) => {
+                for (bucket, config) in map {
+                    cors_config.insert(bucket, Some(config));
+                }
+            }
+            Err(error) => {
+                warn!(
+                    kv_key = "cors",
+                    parse_error = %error,
+                    value_preview = %preview_value(&val, 200),
+                    "failed to parse kv value"
+                );
+            }
+        }
+    } else {
+        warn!(kv_key = "cors", "kv value missing or empty");
     }
     // 读取 spa
-    let spa_value = kv_client.get_kv_value("spa").await.ok().flatten();
+    let spa_value = kv_client.get_kv_value("spa").await?;
     let mut spa = HashMap::new();
     if let Some(val) = spa_value {
-        if let Ok(map) = serde_json::from_str::<HashMap<String, bool>>(&val) {
-            spa = map;
+        info!(
+            kv_key = "spa",
+            value_length = val.len(),
+            value_preview = %preview_value(&val, 200),
+            "loaded raw kv value"
+        );
+        match serde_json::from_str::<HashMap<String, bool>>(&val) {
+            Ok(map) => {
+                spa = map;
+            }
+            Err(error) => {
+                warn!(
+                    kv_key = "spa",
+                    parse_error = %error,
+                    value_preview = %preview_value(&val, 200),
+                    "failed to parse kv value"
+                );
+            }
         }
+    } else {
+        warn!(kv_key = "spa", "kv value missing or empty");
     }
     let mut cache_guard = cache.write().await;
     cache_guard.whitelist = whitelist;
     cache_guard.cors_config = cors_config;
     cache_guard.spa = spa;
+    info!(
+        whitelist_count = cache_guard.whitelist.len(),
+        cors_bucket_count = cache_guard.cors_config.len(),
+        spa_bucket_count = cache_guard.spa.len(),
+        "cache refresh completed"
+    );
     Ok(())
 }

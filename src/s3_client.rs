@@ -2,7 +2,7 @@ use crate::errors::ProxyError;
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::{ Client, Config};
 use axum::body::Body;
-use tracing::{debug, warn};
+use tracing::{info, warn};
 use tokio_util::io::ReaderStream;
 
 pub struct S3Response {
@@ -44,7 +44,7 @@ impl S3Client {
     }
 
     pub async fn get_object(&self, bucket: &str, key: &str) -> Result<S3Response, ProxyError> {
-        debug!("Get object from S3: bucket={}, key={}", bucket, key);
+        info!(bucket = bucket, key = key, "fetching object from s3");
 
         let output = self
             .client
@@ -68,6 +68,14 @@ impl S3Client {
         let content_length = output.content_length().map(|len| len as u64);
         let etag = output.e_tag().map(|s| s.to_string());
         let last_modified = output.last_modified().map(|dt| dt.to_string());
+        info!(
+            bucket = bucket,
+            key = key,
+            content_length = ?content_length,
+            content_type = ?content_type,
+            etag = ?etag,
+            "s3 object fetched successfully"
+        );
 
         // 流式转发 S3 响应体
         let s3_body = output.body.into_async_read();
