@@ -1,15 +1,5 @@
-ARG HTTP_PROXY
-ARG HTTPS_PROXY
-ARG NO_PROXY
-
 FROM rust:1.87-slim-bookworm AS builder
 WORKDIR /app
-ARG HTTP_PROXY
-ARG HTTPS_PROXY
-ARG NO_PROXY
-ENV HTTP_PROXY=${HTTP_PROXY} \
-    HTTPS_PROXY=${HTTPS_PROXY} \
-    NO_PROXY=${NO_PROXY}
 RUN apt-get update && \
     apt-get install -y --no-install-recommends pkg-config libssl-dev ca-certificates && \
     rm -rf /var/lib/apt/lists/*
@@ -25,12 +15,6 @@ COPY src ./src
 RUN cargo build --release && strip target/release/r2-proxy
 
 FROM debian:bookworm-slim AS runtime
-ARG HTTP_PROXY
-ARG HTTPS_PROXY
-ARG NO_PROXY
-ENV HTTP_PROXY=${HTTP_PROXY} \
-    HTTPS_PROXY=${HTTPS_PROXY} \
-    NO_PROXY=${NO_PROXY}
 RUN apt-get update && \
     apt-get install -y --no-install-recommends ca-certificates && \
     rm -rf /var/lib/apt/lists/*
