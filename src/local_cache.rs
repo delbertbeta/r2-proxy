@@ -78,7 +78,7 @@ struct PendingCacheWriteInner {
     accessed_key: String,
     temp_path: PathBuf,
     final_path: PathBuf,
-    file: File,
+    file: Option<File>,
     body_size: u64,
     headers: CachedHeaders,
 }
@@ -302,7 +302,7 @@ impl LocalCache {
                     accessed_key,
                     temp_path,
                     final_path,
-                    file,
+                    file: Some(file),
                     body_size,
                     headers,
                 }),
@@ -490,7 +490,8 @@ impl PendingCacheWrite {
             return Ok(());
         };
 
-        inner.file.write_all(chunk).await.map_err(|error| {
+        let file = inner.file.as_mut().expect("pending cache file must exist");
+        file.write_all(chunk).await.map_err(|error| {
             ProxyError::InternalError(format!("failed to write cache chunk: {error}"))
         })
     }
@@ -500,10 +501,11 @@ impl PendingCacheWrite {
             return Ok(());
         };
 
-        inner.file.flush().await.map_err(|error| {
+        let file = inner.file.as_mut().expect("pending cache file must exist");
+        file.flush().await.map_err(|error| {
             ProxyError::InternalError(format!("failed to flush cache file: {error}"))
         })?;
-        drop(inner.file);
+        inner.file.take();
 
         fs::rename(&inner.temp_path, &inner.final_path)
             .await
@@ -525,7 +527,7 @@ impl PendingCacheWrite {
         let metadata = CacheMetadata {
             file_path: inner.final_path.to_string_lossy().to_string(),
             body_size: inner.body_size,
-            headers: inner.headers,
+            headers: inner.headers.clone(),
             created_at: now,
             last_accessed_at: now,
         };
@@ -562,9 +564,29 @@ impl PendingCacheWrite {
     }
 
     pub async fn abort(mut self) {
-        if let Some(inner) = self.inner.take() {
-            drop(inner.file);
+        if let Some(mut inner) = self.inner.take() {
+            inner.file.take();
             let _ = fs::remove_file(&inner.temp_path).await;
+        }
+    }
+}
+
+impl Drop for PendingCacheWriteInner {
+    fn drop(&mut self) {
+        if self.temp_path.exists() {
+            match std::fs::remove_file(&self.temp_path) {
+                Ok(()) => {
+                    warn!(path = %self.temp_path.display(), "removed abandoned cache temp file");
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    warn!(
+                        path = %self.temp_path.display(),
+                        error = %error,
+                        "failed to remove abandoned cache temp file"
+                    );
+                }
+            }
         }
     }
 }
@@ -572,6 +594,8 @@ impl PendingCacheWrite {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use tokio::time::{sleep, Duration};
 
     #[test]
     fn skips_cache_for_any_index_html_suffix() {
@@ -593,5 +617,38 @@ mod tests {
         assert!(can_stream_store(Some(1024), 2048));
         assert!(!can_stream_store(None, 2048));
         assert!(!can_stream_store(Some(4096), 2048));
+    }
+
+    #[tokio::test]
+    async fn dropping_pending_cache_write_removes_temp_file() {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+        let suffix = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let temp_path = std::env::temp_dir().join(format!("r2-proxy-cache-drop-test-{suffix}.tmp"));
+        let final_path =
+            std::env::temp_dir().join(format!("r2-proxy-cache-drop-test-{suffix}.bin"));
+
+        let file = File::create(&temp_path).await.unwrap();
+        let pending_write = PendingCacheWrite {
+            inner: Some(PendingCacheWriteInner {
+                redis_client: redis::Client::open("redis://127.0.0.1:6379").unwrap(),
+                cache_key: "cache-key".to_string(),
+                metadata_key: "meta".to_string(),
+                total_size_key: "total".to_string(),
+                lfu_key: "lfu".to_string(),
+                accessed_key: "accessed".to_string(),
+                temp_path: temp_path.clone(),
+                final_path: final_path.clone(),
+                file: Some(file),
+                body_size: 1,
+                headers: CachedHeaders::default(),
+            }),
+        };
+
+        drop(pending_write);
+        sleep(Duration::from_millis(25)).await;
+
+        assert!(!temp_path.exists());
+        assert!(!final_path.exists());
     }
 }
