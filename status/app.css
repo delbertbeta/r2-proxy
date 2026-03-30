@@ -149,6 +149,7 @@ button:hover {
 .error-text {
   margin-top: 16px;
   color: var(--rust);
+  min-height: 1.25rem;
 }
 
 .dashboard {

@@ -16,9 +16,6 @@
         <div class="login-card">
           <p class="eyebrow">R2 Proxy Status</p>
           <h1>Operational Board</h1>
-          <p class="muted">
-            Enter the status API key once. This browser will remember it until you clear it.
-          </p>
           <form id="login-form" class="login-form">
             <label for="api-key">API Key</label>
             <input id="api-key" name="api-key" type="password" autocomplete="current-password" required>
@@ -58,6 +55,7 @@
               <button data-range="7d" type="button">7D</button>
             </div>
           </div>
+          <p id="dashboard-error" class="error-text" hidden></p>
           <div id="summary-strip" class="summary-strip"></div>
           <div id="charts" class="chart-grid"></div>
         </section>

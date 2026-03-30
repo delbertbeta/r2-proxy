@@ -10,6 +10,7 @@ const loginPanel = document.getElementById("login-panel");
 const dashboard = document.getElementById("dashboard");
 const loginForm = document.getElementById("login-form");
 const loginError = document.getElementById("login-error");
+const dashboardError = document.getElementById("dashboard-error");
 const bucketFilter = document.getElementById("bucket-filter");
 const logoutButton = document.getElementById("logout-button");
 const metrics = document.getElementById("metrics");
@@ -55,6 +56,16 @@ async function request(path) {
     throw new Error(`request failed: ${response.status}`);
   }
   return response.json();
+}
+
+function showDashboardError(message) {
+  dashboardError.textContent = message;
+  dashboardError.hidden = false;
+}
+
+function clearDashboardError() {
+  dashboardError.textContent = "";
+  dashboardError.hidden = true;
 }
 
 async function login(apiKey) {
@@ -198,8 +209,15 @@ loginForm.addEventListener("submit", async (event) => {
     state.apiKey = apiKey;
     localStorage.setItem(storageKey, apiKey);
     showDashboard();
-    await loadFilters();
-    await refresh();
+    clearDashboardError();
+    loginForm.reset();
+    try {
+      await loadFilters();
+      await refresh();
+    } catch (error) {
+      showDashboardError("Dashboard unlocked, but the first data load failed. Try refreshing in a moment.");
+      console.error(error);
+    }
   } catch {
     loginError.hidden = false;
   }
@@ -207,7 +225,13 @@ loginForm.addEventListener("submit", async (event) => {
 
 bucketFilter.addEventListener("change", async () => {
   state.bucket = bucketFilter.value;
-  await refresh();
+  try {
+    clearDashboardError();
+    await refresh();
+  } catch (error) {
+    showDashboardError("Failed to refresh bucket data.");
+    console.error(error);
+  }
 });
 
 document.querySelectorAll("#range-switcher button").forEach((button) => {
@@ -216,7 +240,13 @@ document.querySelectorAll("#range-switcher button").forEach((button) => {
       candidate.classList.toggle("active", candidate === button);
     });
     state.range = button.dataset.range || "1h";
-    await refresh();
+    try {
+      clearDashboardError();
+      await refresh();
+    } catch (error) {
+      showDashboardError("Failed to refresh the selected time range.");
+      console.error(error);
+    }
   });
 });
 
@@ -235,8 +265,15 @@ logoutButton.addEventListener("click", () => {
   try {
     await loadFilters();
     await refresh();
+    clearDashboardError();
     showDashboard();
-  } catch {
-    showLogin();
+  } catch (error) {
+    if (state.apiKey) {
+      showDashboard();
+      showDashboardError("Stored API key is valid, but the dashboard data is temporarily unavailable.");
+      console.error(error);
+    } else {
+      showLogin();
+    }
   }
 })();
