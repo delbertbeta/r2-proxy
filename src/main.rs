@@ -222,15 +222,18 @@ async fn proxy_handler(
                     cached_response.headers,
                 ),
                 (lookup_status, _) => {
-                    let s3_response = state
-                        .s3_client
-                        .get_object(&real_bucket, &object_key)
-                        .await?;
+                    let s3_response = match state.s3_client.get_object(&real_bucket, &object_key).await {
+                        Ok(response) => response,
+                        Err(error) => {
+                            record_error_event(&state, bucket, request_path_and_query.clone()).await;
+                            return Err(error);
+                        }
+                    };
                     let (response_status, pending_write) =
                         if matches!(lookup_status, CacheStatus::Disabled | CacheStatus::Bypass) {
                             (lookup_status, None)
                         } else {
-                            state
+                            match state
                                 .local_cache
                                 .prepare_stream_store(
                                     &real_bucket,
@@ -238,7 +241,14 @@ async fn proxy_handler(
                                     s3_response.headers.content_length,
                                     s3_response.headers.clone(),
                                 )
-                                .await?
+                                .await
+                            {
+                                Ok(result) => result,
+                                Err(error) => {
+                                    record_error_event(&state, bucket, request_path_and_query.clone()).await;
+                                    return Err(error);
+                                }
+                            }
                         };
 
                     (
