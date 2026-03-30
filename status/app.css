@@ -284,6 +284,7 @@ button:hover {
 }
 
 .chart-card {
+  margin-top: 6px;
   border: 1px solid var(--line);
   border-radius: 20px;
   padding: 18px;

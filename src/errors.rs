@@ -44,18 +44,6 @@ impl ProxyError {
             | Self::InternalError(_) => crate::stats::StatsResult::ServerError,
         }
     }
-
-    pub fn stats_error_kind(&self) -> &'static str {
-        match self {
-            Self::UnauthorizedBucket(_) => "unauthorized_bucket",
-            Self::ObjectNotFound(_) | Self::S3Error(_) => "origin",
-            Self::InvalidPath(_)
-            | Self::HttpError(_)
-            | Self::KvError(_)
-            | Self::ConfigError(_)
-            | Self::InternalError(_) => "internal",
-        }
-    }
 }
 
 impl IntoResponse for ProxyError {
@@ -112,18 +100,6 @@ mod tests {
     use super::ProxyError;
     use crate::stats::StatsResult;
     use axum::{body, http::StatusCode, response::IntoResponse};
-
-    #[test]
-    fn classifies_proxy_errors_for_metrics() {
-        assert_eq!(
-            ProxyError::UnauthorizedBucket("foo".to_string()).stats_error_kind(),
-            "unauthorized_bucket"
-        );
-        assert_eq!(
-            ProxyError::InternalError("boom".to_string()).stats_error_kind(),
-            "internal"
-        );
-    }
 
     #[test]
     fn classifies_proxy_errors_for_stats_breakdown() {
