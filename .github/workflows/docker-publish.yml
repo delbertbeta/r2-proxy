@@ -4,11 +4,6 @@ on:
   push:
     branches: [ master ]
   workflow_dispatch:
-    inputs:
-      ref:
-        description: Git branch, tag, or commit SHA to build
-        required: true
-        default: master
 
 jobs:
   build:
@@ -16,8 +11,6 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
-        with:
-          ref: ${{ inputs.ref || github.ref }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -28,9 +21,18 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      - name: Determine Docker tag
+        id: image_tag
+        run: |
+          if [ "${GITHUB_REF_NAME}" = "master" ]; then
+            echo "tag=main" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=latest" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
         with:
           context: .
           push: true
-          tags: ${{ secrets.DOCKERHUB_USERNAME }}/r2-proxy:latest 
+          tags: ${{ secrets.DOCKERHUB_USERNAME }}/r2-proxy:${{ steps.image_tag.outputs.tag }}
