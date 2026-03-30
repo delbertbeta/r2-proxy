@@ -12,6 +12,7 @@ use std::env;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{error, info, warn};
@@ -28,8 +29,9 @@ mod stats;
 use config::Config;
 use errors::ProxyError;
 use kv_client::KvClient;
-use local_cache::{CacheStatus, LocalCache, PendingCacheWrite};
+use local_cache::{CacheStatus, CachedHeaders, LocalCache, PendingCacheWrite};
 use s3_client::S3Client;
+use stats::{StatsCacheStatus, StatsEvent, StatsResult, StatsStore};
 
 struct AppCache {
     whitelist: HashMap<String, String>, // 虚拟名 -> 真实 bucket
@@ -56,6 +58,7 @@ async fn main() -> anyhow::Result<()> {
     )
     .await?;
     let local_cache = LocalCache::new(config.local_cache.clone(), &config.redis).await;
+    let stats_store = StatsStore::new(&config.redis)?;
     info!(
         cloudflare_account_id = %config.cloudflare_account_id,
         cloudflare_kv_namespace_id = %kv_client.namespace_id(),
@@ -89,6 +92,7 @@ async fn main() -> anyhow::Result<()> {
         .with_state(AppState {
             s3_client,
             local_cache,
+            stats_store,
             cache: cache.clone(),
         });
 
@@ -118,6 +122,7 @@ async fn main() -> anyhow::Result<()> {
 struct AppState {
     s3_client: S3Client,
     local_cache: LocalCache,
+    stats_store: StatsStore,
     cache: Arc<RwLock<AppCache>>,
 }
 
@@ -126,12 +131,24 @@ async fn proxy_handler(
     axum::extract::State(state): axum::extract::State<AppState>,
     axum::extract::Host(host): axum::extract::Host,
 ) -> Result<Response, ProxyError> {
+    let request_path_and_query = uri
+        .path_and_query()
+        .map(|value| value.as_str())
+        .unwrap_or(uri.path())
+        .to_string();
     let bucket = resolve_virtual_bucket(&host);
     info!(host = %host, path = %uri.path(), virtual_bucket = bucket, "incoming request");
     if bucket.is_empty() {
-        return Err(ProxyError::InvalidPath(
+        let error = ProxyError::InvalidPath(
             "Bucket not found in host".to_string(),
-        ));
+        );
+        record_error_event(
+            &state,
+            bucket,
+            request_path_and_query.clone(),
+        )
+        .await;
+        return Err(error);
     }
     let (real_bucket, cors_config, spa_enabled) = {
         let cache = state.cache.read().await;
@@ -180,12 +197,15 @@ async fn proxy_handler(
                 known_virtual_buckets = %known_buckets,
                 "access to bucket denied because whitelist lookup failed"
             );
-            return Err(ProxyError::UnauthorizedBucket(bucket.to_string()));
+            let error = ProxyError::UnauthorizedBucket(bucket.to_string());
+            record_error_event(&state, bucket, request_path_and_query.clone()).await;
+            return Err(error);
         }
     };
 
     let (cache_status, body, cached_headers) =
-        match state.local_cache.get(&real_bucket, &object_key).await? {
+        match state.local_cache.get(&real_bucket, &object_key).await {
+            Ok(result) => match result {
             (CacheStatus::Hit, Some(cached_response)) => (
                 CacheStatus::Hit,
                 Body::from(cached_response.body),
@@ -213,11 +233,29 @@ async fn proxy_handler(
 
                 (
                     response_status,
-                    Body::from_stream(stream_origin_body(s3_response.body, pending_write)),
+                    Body::from_stream(stream_origin_body(
+                        s3_response.body,
+                        pending_write,
+                        Some(StreamStatsContext {
+                            stats_store: state.stats_store.clone(),
+                            timestamp: unix_timestamp(),
+                            bucket: bucket.to_string(),
+                            path_and_query: request_path_and_query.clone(),
+                            object_key: Some(object_key.clone()),
+                            cache_status: stats_cache_status(response_status),
+                        }),
+                    )),
                     s3_response.headers,
                 )
             }
+            },
+            Err(error) => {
+                record_error_event(&state, bucket, request_path_and_query.clone()).await;
+                return Err(error);
+            }
         };
+
+    let response_bytes = successful_response_bytes(cache_status, &cached_headers, 0);
 
     // Build response
     let mut response = Response::new(body);
@@ -275,6 +313,21 @@ async fn proxy_handler(
         "request served successfully"
     );
 
+    if matches!(cache_status, CacheStatus::Hit) {
+        state
+            .stats_store
+            .record(StatsEvent {
+                timestamp: unix_timestamp(),
+                bucket: bucket.to_string(),
+                path_and_query: request_path_and_query,
+                object_key: Some(object_key),
+                bytes: response_bytes,
+                cache_status: stats_cache_status(cache_status),
+                result: StatsResult::Success,
+            })
+            .await;
+    }
+
     Ok(response)
 }
 
@@ -322,6 +375,13 @@ fn preview_value(value: &str, max_chars: usize) -> String {
     }
 }
 
+fn unix_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 fn resolve_object_key(path: &str, spa_enabled: bool) -> String {
     let trimmed_path = path.trim_start_matches('/');
 
@@ -365,13 +425,61 @@ fn apply_cache_status_header(headers: &mut HeaderMap, status: CacheStatus) {
     );
 }
 
+fn stats_cache_status(status: CacheStatus) -> StatsCacheStatus {
+    match status {
+        CacheStatus::Hit => StatsCacheStatus::Hit,
+        CacheStatus::Miss => StatsCacheStatus::Miss,
+        CacheStatus::Bypass => StatsCacheStatus::Bypass,
+        CacheStatus::Disabled => StatsCacheStatus::Disabled,
+    }
+}
+
+fn successful_response_bytes(
+    cache_status: CacheStatus,
+    headers: &CachedHeaders,
+    streamed_bytes: u64,
+) -> u64 {
+    match cache_status {
+        CacheStatus::Hit => headers.content_length.unwrap_or(streamed_bytes),
+        CacheStatus::Miss | CacheStatus::Bypass | CacheStatus::Disabled => streamed_bytes,
+    }
+}
+
+#[derive(Clone)]
+struct StreamStatsContext {
+    stats_store: StatsStore,
+    timestamp: u64,
+    bucket: String,
+    path_and_query: String,
+    object_key: Option<String>,
+    cache_status: StatsCacheStatus,
+}
+
+async fn record_error_event(state: &AppState, bucket: &str, path_and_query: String) {
+    state
+        .stats_store
+        .record(StatsEvent {
+            timestamp: unix_timestamp(),
+            bucket: bucket.to_string(),
+            path_and_query,
+            object_key: None,
+            bytes: 0,
+            cache_status: StatsCacheStatus::Disabled,
+            result: StatsResult::Error,
+        })
+        .await;
+}
+
 fn stream_origin_body(
     upstream_body: aws_sdk_s3::primitives::ByteStream,
     pending_write: Option<PendingCacheWrite>,
+    stats_context: Option<StreamStatsContext>,
 ) -> impl futures_util::Stream<Item = Result<Bytes, io::Error>> {
     try_stream! {
         let mut upstream_body = upstream_body;
         let mut pending_write = pending_write;
+        let mut streamed_bytes = 0_u64;
+        let stats_context = stats_context;
 
         loop {
             let next_chunk = match upstream_body.try_next().await {
@@ -379,6 +487,17 @@ fn stream_origin_body(
                 Err(error) => {
                     if let Some(writer) = pending_write.take() {
                         writer.abort().await;
+                    }
+                    if let Some(context) = stats_context.clone() {
+                        context.stats_store.record(StatsEvent {
+                            timestamp: context.timestamp,
+                            bucket: context.bucket,
+                            path_and_query: context.path_and_query,
+                            object_key: context.object_key,
+                            bytes: 0,
+                            cache_status: context.cache_status,
+                            result: StatsResult::Error,
+                        }).await;
                     }
                     Err(io::Error::other(format!("failed to read s3 stream: {error}")))?;
                     unreachable!();
@@ -398,6 +517,8 @@ fn stream_origin_body(
                 }
             }
 
+            streamed_bytes = streamed_bytes.saturating_add(chunk.len() as u64);
+
             yield chunk;
         }
 
@@ -405,6 +526,18 @@ fn stream_origin_body(
             if let Err(error) = writer.commit().await {
                 warn!(error = %error, "stream cache commit failed");
             }
+        }
+
+        if let Some(context) = stats_context {
+            context.stats_store.record(StatsEvent {
+                timestamp: context.timestamp,
+                bucket: context.bucket,
+                path_and_query: context.path_and_query,
+                object_key: context.object_key,
+                bytes: streamed_bytes,
+                cache_status: context.cache_status,
+                result: StatsResult::Success,
+            }).await;
         }
     }
 }
@@ -489,6 +622,24 @@ mod tests {
         apply_cache_status_header(&mut headers, CacheStatus::Hit);
 
         assert_eq!(headers.get("x-r2-proxy-cached").unwrap(), "HIT");
+    }
+
+    #[test]
+    fn counts_hit_bytes_from_cached_headers() {
+        let headers = CachedHeaders {
+            content_type: None,
+            content_length: Some(1024),
+            etag: None,
+            last_modified: None,
+        };
+
+        assert_eq!(successful_response_bytes(CacheStatus::Hit, &headers, 0), 1024);
+    }
+
+    #[test]
+    fn excludes_bypass_and_disabled_from_cache_rate_denominator() {
+        assert!(stats_cache_status(CacheStatus::Bypass).is_non_cacheable());
+        assert!(stats_cache_status(CacheStatus::Disabled).is_non_cacheable());
     }
 }
 

@@ -1,3 +1,9 @@
+use chrono::{TimeZone, Utc};
+use redis::AsyncCommands;
+use tracing::warn;
+
+use crate::config::RedisConfig;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Resolution {
     FiveMinutes,
@@ -11,6 +17,21 @@ impl Resolution {
             Self::FiveMinutes => 300,
             Self::OneHour => 3600,
             Self::OneDay => 86400,
+        }
+    }
+
+    pub fn redis_key(self) -> &'static str {
+        match self {
+            Self::FiveMinutes => "5m",
+            Self::OneHour => "1h",
+            Self::OneDay => "1d",
+        }
+    }
+
+    pub fn ttl_seconds(self) -> i64 {
+        match self {
+            Self::FiveMinutes | Self::OneHour => 8 * 24 * 60 * 60,
+            Self::OneDay => 10 * 24 * 60 * 60,
         }
     }
 }
@@ -78,6 +99,14 @@ impl StatsCacheStatus {
     pub fn is_non_cacheable(self) -> bool {
         matches!(self, Self::Bypass | Self::Disabled)
     }
+
+    pub fn counts_as_hit(self) -> bool {
+        matches!(self, Self::Hit)
+    }
+
+    pub fn counts_as_miss(self) -> bool {
+        matches!(self, Self::Miss)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -116,14 +145,163 @@ impl StatsStore {
         &self.key_prefix
     }
 
-    pub fn redis_client(&self) -> &redis::Client {
-        &self.redis_client
+    pub async fn record(&self, event: StatsEvent) {
+        if let Err(error) = self.record_inner(&event).await {
+            warn!(
+                error = %error,
+                bucket = %event.bucket,
+                path = %event.path_and_query,
+                "failed to record stats event"
+            );
+        }
+    }
+
+    async fn record_inner(&self, event: &StatsEvent) -> Result<(), redis::RedisError> {
+        let mut connection = self.redis_client.get_multiplexed_async_connection().await?;
+
+        for scope in [StatsScope::Global, StatsScope::Bucket(event.bucket.clone())] {
+            let totals_key = self.totals_key(&scope);
+            let _: () = redis::pipe()
+                .cmd("HINCRBY")
+                .arg(&totals_key)
+                .arg("requests")
+                .arg(1)
+                .cmd("HINCRBY")
+                .arg(&totals_key)
+                .arg("bytes")
+                .arg(event.bytes as i64)
+                .cmd("HINCRBY")
+                .arg(&totals_key)
+                .arg("cache_hits")
+                .arg(if event.cache_status.counts_as_hit() { 1 } else { 0 })
+                .cmd("HINCRBY")
+                .arg(&totals_key)
+                .arg("cache_misses")
+                .arg(if event.cache_status.counts_as_miss() { 1 } else { 0 })
+                .cmd("HINCRBY")
+                .arg(&totals_key)
+                .arg("errors")
+                .arg(if matches!(event.result, StatsResult::Error) { 1 } else { 0 })
+                .query_async(&mut connection)
+                .await?;
+
+            for resolution in [Resolution::FiveMinutes, Resolution::OneHour, Resolution::OneDay] {
+                let series_key =
+                    self.bucket_key(&scope, resolution, bucket_start(event.timestamp, resolution));
+                let _: () = redis::pipe()
+                    .cmd("HINCRBY")
+                    .arg(&series_key)
+                    .arg("requests")
+                    .arg(1)
+                    .cmd("HINCRBY")
+                    .arg(&series_key)
+                    .arg("bytes")
+                    .arg(event.bytes as i64)
+                    .cmd("HINCRBY")
+                    .arg(&series_key)
+                    .arg("cache_hits")
+                    .arg(if event.cache_status.counts_as_hit() { 1 } else { 0 })
+                    .cmd("HINCRBY")
+                    .arg(&series_key)
+                    .arg("cache_misses")
+                    .arg(if event.cache_status.counts_as_miss() { 1 } else { 0 })
+                    .cmd("HINCRBY")
+                    .arg(&series_key)
+                    .arg("errors")
+                    .arg(if matches!(event.result, StatsResult::Error) { 1 } else { 0 })
+                    .cmd("EXPIRE")
+                    .arg(&series_key)
+                    .arg(resolution.ttl_seconds())
+                    .query_async(&mut connection)
+                    .await?;
+            }
+
+            match event.result {
+                StatsResult::Success if event.cache_status.counts_as_hit() => {
+                    if let Some(object_key) = &event.object_key {
+                        let key = self.daily_top_hits_key(&scope, event.timestamp);
+                        let member = format!("{}|{}", event.bucket, object_key);
+                        let _: f64 = connection.zincr(&key, member, 1).await?;
+                        let _: bool = connection.expire(&key, Resolution::OneDay.ttl_seconds()).await?;
+                    }
+                }
+                StatsResult::Success if event.cache_status.counts_as_miss() => {
+                    let key = self.daily_top_misses_key(&scope, event.timestamp);
+                    let member = format!("{}|{}", event.bucket, event.path_and_query);
+                    let _: f64 = connection.zincr(&key, member, 1).await?;
+                    let _: bool = connection.expire(&key, Resolution::OneDay.ttl_seconds()).await?;
+                }
+                StatsResult::Error => {
+                    let key = self.daily_top_errors_key(&scope, event.timestamp);
+                    let member = format!("{}|{}", event.bucket, event.path_and_query);
+                    let _: f64 = connection.zincr(&key, member, 1).await?;
+                    let _: bool = connection.expire(&key, Resolution::OneDay.ttl_seconds()).await?;
+                }
+                _ => {}
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn totals_key(&self, scope: &StatsScope) -> String {
+        format!("{}:stats:totals:{}", self.key_prefix, scope.redis_key())
+    }
+
+    pub fn bucket_key(
+        &self,
+        scope: &StatsScope,
+        resolution: Resolution,
+        bucket_start: u64,
+    ) -> String {
+        format!(
+            "{}:stats:ts:{}:{}:{}",
+            self.key_prefix,
+            resolution.redis_key(),
+            scope.redis_key(),
+            bucket_start
+        )
+    }
+
+    pub fn daily_top_hits_key(&self, scope: &StatsScope, timestamp: u64) -> String {
+        format!(
+            "{}:stats:top:hits:{}:{}",
+            self.key_prefix,
+            scope.redis_key(),
+            day_stamp(timestamp)
+        )
+    }
+
+    pub fn daily_top_misses_key(&self, scope: &StatsScope, timestamp: u64) -> String {
+        format!(
+            "{}:stats:top:misses:{}:{}",
+            self.key_prefix,
+            scope.redis_key(),
+            day_stamp(timestamp)
+        )
+    }
+
+    pub fn daily_top_errors_key(&self, scope: &StatsScope, timestamp: u64) -> String {
+        format!(
+            "{}:stats:top:errors:{}:{}",
+            self.key_prefix,
+            scope.redis_key(),
+            day_stamp(timestamp)
+        )
     }
 }
 
 pub fn bucket_start(timestamp: u64, resolution: Resolution) -> u64 {
     let duration = resolution.duration_seconds();
     timestamp - (timestamp % duration)
+}
+
+fn day_stamp(timestamp: u64) -> String {
+    Utc.timestamp_opt(timestamp as i64, 0)
+        .single()
+        .unwrap_or_else(|| Utc.timestamp_opt(0, 0).single().expect("unix epoch"))
+        .format("%Y_%m_%d")
+        .to_string()
 }
 
 #[cfg(test)]
@@ -162,7 +340,25 @@ mod tests {
         let store = StatsStore::new(&redis).unwrap();
 
         assert_eq!(store.key_prefix(), "r2proxy");
-        let _ = store.redis_client();
+    }
+
+    #[test]
+    fn builds_expected_redis_keys() {
+        let redis = RedisConfig {
+            redis_url: "redis://127.0.0.1:6379".to_string(),
+            redis_key_prefix: "r2proxy".to_string(),
+        };
+        let store = StatsStore::new(&redis).unwrap();
+        let scope = StatsScope::Bucket("foo".to_string());
+
+        assert_eq!(store.totals_key(&scope), "r2proxy:stats:totals:bucket:foo");
+        assert_eq!(
+            store.bucket_key(&scope, Resolution::FiveMinutes, 1_711_753_200),
+            "r2proxy:stats:ts:5m:bucket:foo:1711753200"
+        );
+        assert_eq!(
+            store.daily_top_errors_key(&scope, 1_711_753_499),
+            "r2proxy:stats:top:errors:bucket:foo:2024_03_29"
+        );
     }
 }
-use crate::config::RedisConfig;

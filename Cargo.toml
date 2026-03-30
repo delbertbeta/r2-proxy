@@ -21,7 +21,7 @@ aws-smithy-types = "1.0"
 aws-smithy-runtime-api = "1.0"
 
 # HTTP 客户端
-reqwest = { version = "0.11", features = ["stream"] }
+reqwest = { version = "0.11", default-features = false, features = ["rustls-tls", "stream"] }
 
 # 序列化
 serde = { version = "1.0", features = ["derive"] }
@@ -45,3 +45,4 @@ redis = { version = "0.27", features = ["tokio-comp"] }
 
 # 环境变量
 dotenv = "0.15"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }

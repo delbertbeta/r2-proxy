@@ -133,6 +133,12 @@ fn parse_size(input: &str) -> Result<u64, ConfigError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
 
     fn set_base_env() {
         unsafe {
@@ -152,6 +158,7 @@ mod tests {
 
     #[test]
     fn config_reads_status_server_settings() {
+        let _guard = env_lock();
         set_base_env();
         unsafe {
             env::set_var("STATUS_PORT", "3009");
@@ -168,6 +175,7 @@ mod tests {
 
     #[test]
     fn config_uses_safe_status_defaults() {
+        let _guard = env_lock();
         set_base_env();
         unsafe {
             env::remove_var("STATUS_PORT");
@@ -183,6 +191,7 @@ mod tests {
 
     #[test]
     fn config_reads_global_redis_settings_without_local_cache() {
+        let _guard = env_lock();
         set_base_env();
         unsafe {
             env::set_var("REDIS_URL", "redis://cache.internal:6379");
@@ -206,6 +215,7 @@ mod tests {
 
     #[test]
     fn config_reads_optional_local_cache_and_redis_settings() {
+        let _guard = env_lock();
         set_base_env();
         unsafe {
             env::set_var("LOCAL_CACHE_ENABLED", "true");
