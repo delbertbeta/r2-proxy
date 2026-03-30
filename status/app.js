@@ -5,6 +5,11 @@ const state = {
   range: "1h",
   bucket: "",
 };
+const errorMetricKeys = {
+  totalRate: "errorRate",
+  notFoundRate: "notFoundErrorRate",
+  serverRate: "serverErrorRate",
+};
 const chartInstances = [];
 
 const loginPanel = document.getElementById("login-panel");
@@ -19,7 +24,8 @@ const summaryStrip = document.getElementById("summary-strip");
 const charts = document.getElementById("charts");
 const hotFiles = document.getElementById("hot-files");
 const missUrls = document.getElementById("miss-urls");
-const errorUrls = document.getElementById("error-urls");
+const notFoundUrls = document.getElementById("not-found-urls");
+const serverErrorUrls = document.getElementById("server-error-urls");
 
 function formatBytes(bytes) {
   if (!bytes) return "0 B";
@@ -107,7 +113,11 @@ function renderMetrics(overview) {
     metricCard("Total Requests", formatCompact(overview.totals.requests), "All successful and failed requests"),
     metricCard("Total Throughput", formatBytes(overview.totals.bytes), "Served successfully to clients"),
     metricCard("Cache Hit Rate", formatRate(overview.totals.cacheHitRate), "Hit / (Hit + Miss)"),
-    metricCard("Errors", formatCompact(overview.totals.errors), `Error rate ${formatRate(overview.totals.errorRate)}`),
+    metricCard(
+      "Errors",
+      formatCompact(overview.totals.errors),
+      `404 ${formatCompact(overview.totals.notFoundErrors)} · 5xx ${formatCompact(overview.totals.serverErrors)}`
+    ),
     metricCard("Local Cache", formatBytes(overview.localCache.usedBytes), `${formatRate(overview.localCache.usageRate)} of ${formatBytes(overview.localCache.capacityBytes)}`),
   ].join("");
 }
@@ -117,7 +127,9 @@ function renderSummary(summary) {
     ["Requests", formatCompact(summary.requests)],
     ["Traffic", formatBytes(summary.bytes)],
     ["Hit Rate", formatRate(summary.cacheHitRate)],
-    ["Error Rate", formatRate(summary.errorRate)],
+    ["Error Rate", formatRate(summary[errorMetricKeys.totalRate])],
+    ["404 Rate", formatRate(summary[errorMetricKeys.notFoundRate])],
+    ["5xx Rate", formatRate(summary[errorMetricKeys.serverRate])],
   ].map(([label, value]) => `
       <div class="summary-item">
         <span>${label}</span>
@@ -146,7 +158,8 @@ function renderCharts(series) {
     chartCardMarkup("chart-qps", "QPS", series.qps, (value) => value.toFixed(2)),
     chartCardMarkup("chart-throughput", "Throughput", series.throughputBytesPerSec, (value) => formatBytes(value)),
     chartCardMarkup("chart-hit-rate", "Cache Hit Rate", series.cacheHitRate, formatRate),
-    chartCardMarkup("chart-error-rate", "Error Rate", series.errorRate, formatRate),
+    chartCardMarkup("chart-404-rate", "404 Rate", series[errorMetricKeys.notFoundRate], formatRate),
+    chartCardMarkup("chart-5xx-rate", "5xx Rate", series[errorMetricKeys.serverRate], formatRate),
   ].join("");
 
   [
@@ -169,9 +182,15 @@ function renderCharts(series) {
       formatter: formatRate,
     },
     {
-      id: "chart-error-rate",
+      id: "chart-404-rate",
+      color: "#c0841a",
+      points: series[errorMetricKeys.notFoundRate],
+      formatter: formatRate,
+    },
+    {
+      id: "chart-5xx-rate",
       color: "#b4432f",
-      points: series.errorRate,
+      points: series[errorMetricKeys.serverRate],
       formatter: formatRate,
     },
   ].forEach(({ id, color, points, formatter }) => {
@@ -281,7 +300,8 @@ async function refresh() {
   renderCharts(timeseries.series);
   renderTable(hotFiles, top.hotCacheFiles, "hits");
   renderTable(missUrls, top.missUrls, "misses");
-  renderTable(errorUrls, top.errorUrls, "errors");
+  renderTable(notFoundUrls, top.notFoundUrls, "errors");
+  renderTable(serverErrorUrls, top.serverErrorUrls, "errors");
 }
 
 loginForm.addEventListener("submit", async (event) => {
