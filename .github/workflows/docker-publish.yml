@@ -25,9 +25,14 @@ jobs:
         id: image_tag
         run: |
           if [ "${GITHUB_REF_NAME}" = "master" ]; then
-            echo "tag=main" >> "$GITHUB_OUTPUT"
+            {
+              echo "tags<<EOF"
+              echo "${{ secrets.DOCKERHUB_USERNAME }}/r2-proxy:main"
+              echo "${{ secrets.DOCKERHUB_USERNAME }}/r2-proxy:latest"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
           else
-            echo "tag=latest" >> "$GITHUB_OUTPUT"
+            echo "tags=${{ secrets.DOCKERHUB_USERNAME }}/r2-proxy:latest" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Build and push Docker image
@@ -35,4 +40,4 @@ jobs:
         with:
           context: .
           push: true
-          tags: ${{ secrets.DOCKERHUB_USERNAME }}/r2-proxy:${{ steps.image_tag.outputs.tag }}
+          tags: ${{ steps.image_tag.outputs.tags }}
