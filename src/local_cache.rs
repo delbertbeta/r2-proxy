@@ -61,6 +61,23 @@ pub struct LocalCache {
     inner: Option<LocalCacheInner>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct LocalCacheUsage {
+    pub enabled: bool,
+    pub used_bytes: u64,
+    pub capacity_bytes: u64,
+}
+
+impl LocalCacheUsage {
+    pub fn usage_rate(self) -> f64 {
+        if !self.enabled || self.capacity_bytes == 0 {
+            0.0
+        } else {
+            self.used_bytes as f64 / self.capacity_bytes as f64
+        }
+    }
+}
+
 #[derive(Clone)]
 struct LocalCacheInner {
     redis_client: redis::Client,
@@ -85,6 +102,10 @@ struct PendingCacheWriteInner {
 }
 
 impl LocalCache {
+    pub fn disabled() -> Self {
+        Self { inner: None }
+    }
+
     pub async fn new(config: Option<LocalCacheConfig>, redis: &RedisConfig) -> Self {
         let Some(config) = config else {
             return Self { inner: None };
@@ -310,6 +331,32 @@ impl LocalCache {
                 }),
             }),
         ))
+    }
+
+    pub async fn usage(&self) -> LocalCacheUsage {
+        let Some(inner) = &self.inner else {
+            return LocalCacheUsage::default();
+        };
+
+        let mut connection = match inner.redis_client.get_multiplexed_async_connection().await {
+            Ok(connection) => connection,
+            Err(error) => {
+                warn!(error = %error, "redis unavailable while reading local cache usage");
+                return LocalCacheUsage {
+                    enabled: true,
+                    used_bytes: 0,
+                    capacity_bytes: inner.max_size_bytes,
+                };
+            }
+        };
+
+        let used_bytes: Option<u64> = connection.get(inner.redis_total_size_key()).await.ok();
+
+        LocalCacheUsage {
+            enabled: true,
+            used_bytes: used_bytes.unwrap_or(0),
+            capacity_bytes: inner.max_size_bytes,
+        }
     }
 }
 
@@ -632,6 +679,22 @@ mod tests {
         assert_eq!(CacheStatus::Miss.header_value(), "MISS");
         assert_eq!(CacheStatus::Bypass.header_value(), "BYPASS");
         assert_eq!(CacheStatus::Disabled.header_value(), "DISABLED");
+    }
+
+    #[tokio::test]
+    async fn cache_usage_is_disabled_when_local_cache_is_off() {
+        let redis = RedisConfig {
+            redis_url: "redis://127.0.0.1:6379".to_string(),
+            redis_key_prefix: "r2proxy".to_string(),
+        };
+        let cache = LocalCache::new(None, &redis).await;
+
+        let usage = cache.usage().await;
+
+        assert!(!usage.enabled);
+        assert_eq!(usage.used_bytes, 0);
+        assert_eq!(usage.capacity_bytes, 0);
+        assert_eq!(usage.usage_rate(), 0.0);
     }
 
     #[test]

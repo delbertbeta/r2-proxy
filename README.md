@@ -1,3 +1,9 @@
+---
+title: README
+type: note
+permalink: work/r2-proxy/readme
+---
+
 # R2 代理服务器
 
 一个高性能的 Rust S3 代理服务器，用于代理 Cloudflare R2 存储的请求。
@@ -9,6 +15,7 @@
 - ⚡ **高性能**: 支持流式传输，节省内存和存储资源
 - 🛡️ **安全**: 只允许 GET 和 OPTIONS 请求
 - 📊 **日志**: 完整的请求日志和错误追踪
+- 🖥️ **Status 页面**: 启动时同时暴露独立监控端口，查看流量、缓存、错误和热点排行
 
 ## 环境变量配置
 
@@ -17,6 +24,13 @@
 ```env
 # 服务器配置
 PORT=3000
+STATUS_PORT=3001
+STATUS_HOST=127.0.0.1
+STATUS_API_KEY=change-me
+
+# Redis 配置
+REDIS_URL=redis://127.0.0.1:6379
+REDIS_KEY_PREFIX=r2proxy
 
 # Cloudflare 配置
 CLOUDFLARE_ACCOUNT_ID=your_cloudflare_account_id
@@ -32,15 +46,69 @@ R2_SECRET_ACCESS_KEY=your_r2_secret_access_key
 LOCAL_CACHE_ENABLED=true
 LOCAL_CACHE_MAX_SIZE=1G
 LOCAL_CACHE_DIR=/var/cache/r2-proxy
-REDIS_URL=redis://127.0.0.1:6379
-REDIS_KEY_PREFIX=r2proxy
 ```
 
+- `STATUS_HOST` 默认是 `127.0.0.1`，也就是 status 服务默认只监听本机
+- `STATUS_PORT` 默认是 `3001`
+- `STATUS_API_KEY` 是 status 页面和 `/api/*` 接口的访问密钥
+- `REDIS_URL` / `REDIS_KEY_PREFIX` 现在是全局配置，同时用于本地缓存元数据和 status 指标存储
 - `LOCAL_CACHE_MAX_SIZE` 支持自然语言容量，例如 `512M`、`1G`、`1024K`
 - 任何以 `index.html` 结尾的对象路径都不会进入本地缓存
 - 每个响应都会带 `X-R2-Proxy-Cached`，取值为 `HIT`、`MISS`、`BYPASS`、`DISABLED`
 - 本地磁盘只保存响应体，缓存元数据、响应头和 LFU 索引存放在 Redis 中
 - 如果 Redis 不可用，本地缓存会自动降级为禁用状态，请求继续回源
+- status 指标也使用 Redis 保存：
+  - 全量累计指标：总请求数、总流量、缓存命中率、错误数/错误率
+  - 最近 7 天明细：`1h` 按 `5m`、`24h` 按 `1h`、`7d` 按 `1d`
+  - Top10 榜单：热缓存文件、最多 miss URL、最多错误 URL
+
+## Status 页面
+
+服务启动后会同时监听两个端口：
+
+- `PORT`：现有代理服务
+- `STATUS_HOST:STATUS_PORT`：status 页面和监控 API
+
+页面功能包括：
+
+- 总请求数
+- 总流量大小
+- 总缓存命中率
+- 总错误数 / 错误率
+- 本地缓存占用大小 / 使用率
+- `1h / 24h / 7d` 的 QPS、吞吐、缓存命中率、错误率折线图
+- 最近 7 天 Top10：
+  - 最热缓存文件
+  - 最多 miss 的请求 URL
+  - 最多错误的请求 URL
+- 支持按虚拟 bucket 过滤
+
+### 访问方式
+
+1. 打开 `http://127.0.0.1:3001/`（如果改了 `STATUS_HOST` / `STATUS_PORT`，按你的配置访问）
+2. 首次打开输入 `STATUS_API_KEY`
+3. 页面验证成功后会把 key 保存在浏览器 `localStorage`
+4. 之后页面会自动带上 `X-Status-API-Key`
+
+如果 API key 变更或输入错误，页面会自动清掉本地缓存的 key 并回到登录页。
+
+### API 示例
+
+```bash
+curl -X POST http://127.0.0.1:3001/api/login \
+  -H 'content-type: application/json' \
+  -d '{"apiKey":"change-me"}'
+```
+
+```bash
+curl http://127.0.0.1:3001/api/overview \
+  -H 'X-Status-API-Key: change-me'
+```
+
+```bash
+curl 'http://127.0.0.1:3001/api/timeseries?range=24h&bucket=@' \
+  -H 'X-Status-API-Key: change-me'
+```
 
 ## Cloudflare KV 配置
 
@@ -124,6 +192,8 @@ cargo build
 cargo run
 ```
 
+启动后日志中会同时看到代理端口和 status 端口的监听信息。
+
 ### 生产环境
 
 ```bash
@@ -134,6 +204,8 @@ cargo build --release
 ./target/release/r2-proxy
 ```
 
+如果你需要把 status 页面暴露给外部访问，可以把 `STATUS_HOST` 改成 `0.0.0.0`，但仍然建议放在反向代理或内网环境后面。
+
 ## 项目结构
 
 ```
@@ -142,6 +214,10 @@ src/
 ├── config.rs        # 配置管理
 ├── errors.rs        # 错误处理
 ├── cors.rs          # CORS 配置
+├── stats.rs         # Redis 指标采集和查询
+├── status_server.rs # Status API 和页面服务
+├── status_assets.rs # 嵌入式前端资源
+├── local_cache.rs   # 本地磁盘缓存
 ├── kv_client.rs     # Cloudflare KV 客户端
 └── s3_client.rs     # S3/R2 客户端
 ```
@@ -178,5 +254,15 @@ docker run -d -p 3000:3000 --name r2-proxy --restart unless-stopped --volume .en
 
 ### 或直接用环境变量
 ```bash
-docker run --rm -p 3000:3000 -e PORT=3000 -e CLOUDFLARE_ACCOUNT_ID=xxx ... delbertbeta/r2-proxy:latest
-``` 
+docker run --rm \
+  -p 3000:3000 \
+  -p 3001:3001 \
+  -e PORT=3000 \
+  -e STATUS_PORT=3001 \
+  -e STATUS_HOST=0.0.0.0 \
+  -e STATUS_API_KEY=change-me \
+  -e REDIS_URL=redis://redis:6379 \
+  -e CLOUDFLARE_ACCOUNT_ID=xxx \
+  ... \
+  delbertbeta/r2-proxy:latest
+```

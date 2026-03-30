@@ -33,9 +33,11 @@ impl ProxyError {
         match self {
             Self::UnauthorizedBucket(_) => "unauthorized_bucket",
             Self::S3Error(_) => "origin",
-            Self::InvalidPath(_) | Self::HttpError(_) | Self::KvError(_) | Self::ConfigError(_) | Self::InternalError(_) => {
-                "internal"
-            }
+            Self::InvalidPath(_)
+            | Self::HttpError(_)
+            | Self::KvError(_)
+            | Self::ConfigError(_)
+            | Self::InternalError(_) => "internal",
         }
     }
 }

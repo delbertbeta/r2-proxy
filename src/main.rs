@@ -25,6 +25,8 @@ mod kv_client;
 mod local_cache;
 mod s3_client;
 mod stats;
+mod status_assets;
+mod status_server;
 
 use config::Config;
 use errors::ProxyError;
@@ -32,8 +34,10 @@ use kv_client::KvClient;
 use local_cache::{CacheStatus, CachedHeaders, LocalCache, PendingCacheWrite};
 use s3_client::S3Client;
 use stats::{StatsCacheStatus, StatsEvent, StatsResult, StatsStore};
+use status_server::{build_status_router, StatusState};
 
-struct AppCache {
+#[derive(Default)]
+pub(crate) struct AppCache {
     whitelist: HashMap<String, String>, // 虚拟名 -> 真实 bucket
     cors_config: HashMap<String, Option<cors::CorsConfig>>,
     spa: HashMap<String, bool>,
@@ -91,10 +95,16 @@ async fn main() -> anyhow::Result<()> {
         .layer(cors)
         .with_state(AppState {
             s3_client,
-            local_cache,
-            stats_store,
+            local_cache: local_cache.clone(),
+            stats_store: stats_store.clone(),
             cache: cache.clone(),
         });
+    let status_app = build_status_router(StatusState {
+        api_key: Arc::new(config.status.api_key.clone()),
+        stats_store,
+        local_cache: local_cache.clone(),
+        cache: cache.clone(),
+    });
 
     // Start refresh task
     let kv_client_clone = kv_client.clone();
@@ -109,11 +119,18 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // Start server
-    let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
-    info!(address = %addr, "server listening");
+    let proxy_addr = SocketAddr::from(([0, 0, 0, 0], config.port));
+    let status_addr = status_socket_addr(&config.status.host, config.status.port)?;
+    info!(address = %proxy_addr, "server listening");
+    info!(address = %status_addr, "status server listening");
 
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    let proxy_listener = tokio::net::TcpListener::bind(proxy_addr).await?;
+    let status_listener = tokio::net::TcpListener::bind(status_addr).await?;
+
+    tokio::try_join!(
+        axum::serve(proxy_listener, app),
+        axum::serve(status_listener, status_app)
+    )?;
 
     Ok(())
 }
@@ -139,15 +156,8 @@ async fn proxy_handler(
     let bucket = resolve_virtual_bucket(&host);
     info!(host = %host, path = %uri.path(), virtual_bucket = bucket, "incoming request");
     if bucket.is_empty() {
-        let error = ProxyError::InvalidPath(
-            "Bucket not found in host".to_string(),
-        );
-        record_error_event(
-            &state,
-            bucket,
-            request_path_and_query.clone(),
-        )
-        .await;
+        let error = ProxyError::InvalidPath("Bucket not found in host".to_string());
+        record_error_event(&state, bucket, request_path_and_query.clone()).await;
         return Err(error);
     }
     let (real_bucket, cors_config, spa_enabled) = {
@@ -206,48 +216,48 @@ async fn proxy_handler(
     let (cache_status, body, cached_headers) =
         match state.local_cache.get(&real_bucket, &object_key).await {
             Ok(result) => match result {
-            (CacheStatus::Hit, Some(cached_response)) => (
-                CacheStatus::Hit,
-                Body::from(cached_response.body),
-                cached_response.headers,
-            ),
-            (lookup_status, _) => {
-                let s3_response = state
-                    .s3_client
-                    .get_object(&real_bucket, &object_key)
-                    .await?;
-                let (response_status, pending_write) =
-                    if matches!(lookup_status, CacheStatus::Disabled | CacheStatus::Bypass) {
-                        (lookup_status, None)
-                    } else {
-                        state
-                            .local_cache
-                            .prepare_stream_store(
-                                &real_bucket,
-                                &object_key,
-                                s3_response.headers.content_length,
-                                s3_response.headers.clone(),
-                            )
-                            .await?
-                    };
+                (CacheStatus::Hit, Some(cached_response)) => (
+                    CacheStatus::Hit,
+                    Body::from(cached_response.body),
+                    cached_response.headers,
+                ),
+                (lookup_status, _) => {
+                    let s3_response = state
+                        .s3_client
+                        .get_object(&real_bucket, &object_key)
+                        .await?;
+                    let (response_status, pending_write) =
+                        if matches!(lookup_status, CacheStatus::Disabled | CacheStatus::Bypass) {
+                            (lookup_status, None)
+                        } else {
+                            state
+                                .local_cache
+                                .prepare_stream_store(
+                                    &real_bucket,
+                                    &object_key,
+                                    s3_response.headers.content_length,
+                                    s3_response.headers.clone(),
+                                )
+                                .await?
+                        };
 
-                (
-                    response_status,
-                    Body::from_stream(stream_origin_body(
-                        s3_response.body,
-                        pending_write,
-                        Some(StreamStatsContext {
-                            stats_store: state.stats_store.clone(),
-                            timestamp: unix_timestamp(),
-                            bucket: bucket.to_string(),
-                            path_and_query: request_path_and_query.clone(),
-                            object_key: Some(object_key.clone()),
-                            cache_status: stats_cache_status(response_status),
-                        }),
-                    )),
-                    s3_response.headers,
-                )
-            }
+                    (
+                        response_status,
+                        Body::from_stream(stream_origin_body(
+                            s3_response.body,
+                            pending_write,
+                            Some(StreamStatsContext {
+                                stats_store: state.stats_store.clone(),
+                                timestamp: unix_timestamp(),
+                                bucket: bucket.to_string(),
+                                path_and_query: request_path_and_query.clone(),
+                                object_key: Some(object_key.clone()),
+                                cache_status: stats_cache_status(response_status),
+                            }),
+                        )),
+                        s3_response.headers,
+                    )
+                }
             },
             Err(error) => {
                 record_error_event(&state, bucket, request_path_and_query.clone()).await;
@@ -345,6 +355,12 @@ fn init_logging() {
         .with_writer(std::io::stdout)
         .with_ansi(false)
         .init();
+}
+
+fn status_socket_addr(host: &str, port: u16) -> anyhow::Result<SocketAddr> {
+    format!("{host}:{port}")
+        .parse::<SocketAddr>()
+        .map_err(|error| anyhow::anyhow!("invalid status bind address: {error}"))
 }
 
 fn default_log_filter(value: Option<&str>) -> &str {
@@ -566,6 +582,12 @@ mod tests {
     }
 
     #[test]
+    fn parses_status_socket_addr() {
+        let addr = status_socket_addr("127.0.0.1", 3001).unwrap();
+        assert_eq!(addr.to_string(), "127.0.0.1:3001");
+    }
+
+    #[test]
     fn resolves_virtual_bucket_from_root_domain_host() {
         assert_eq!(resolve_virtual_bucket("delbertbeta.life"), "@");
     }
@@ -633,7 +655,10 @@ mod tests {
             last_modified: None,
         };
 
-        assert_eq!(successful_response_bytes(CacheStatus::Hit, &headers, 0), 1024);
+        assert_eq!(
+            successful_response_bytes(CacheStatus::Hit, &headers, 0),
+            1024
+        );
     }
 
     #[test]
