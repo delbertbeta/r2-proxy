@@ -12,6 +12,7 @@ RUN mkdir src && \
     rm -rf src target/release/deps/r2_proxy*
 
 COPY src ./src
+COPY status ./status
 RUN cargo build --release && strip target/release/r2-proxy
 
 FROM debian:bookworm-slim AS runtime
@@ -21,5 +22,5 @@ RUN apt-get update && \
 
 COPY --from=builder /app/target/release/r2-proxy /usr/local/bin/r2-proxy
 
-EXPOSE 3000
+EXPOSE 3000 3001
 ENTRYPOINT ["/usr/local/bin/r2-proxy"]
