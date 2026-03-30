@@ -7,7 +7,7 @@ use tokio::fs::{self, File};
 use tokio::io::AsyncWriteExt;
 use tracing::{info, warn};
 
-use crate::config::LocalCacheConfig;
+use crate::config::{LocalCacheConfig, RedisConfig};
 use crate::errors::ProxyError;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -85,7 +85,7 @@ struct PendingCacheWriteInner {
 }
 
 impl LocalCache {
-    pub async fn new(config: Option<LocalCacheConfig>) -> Self {
+    pub async fn new(config: Option<LocalCacheConfig>, redis: &RedisConfig) -> Self {
         let Some(config) = config else {
             return Self { inner: None };
         };
@@ -94,7 +94,7 @@ impl LocalCache {
             return Self { inner: None };
         }
 
-        let redis_client = match redis::Client::open(config.redis_url.clone()) {
+        let redis_client = match redis::Client::open(redis.redis_url.clone()) {
             Ok(client) => client,
             Err(error) => {
                 warn!(error = %error, "failed to create redis client, local cache disabled");
@@ -129,7 +129,7 @@ impl LocalCache {
                 redis_client,
                 directory: PathBuf::from(config.directory),
                 max_size_bytes: config.max_size_bytes,
-                key_prefix: config.redis_key_prefix,
+                key_prefix: redis.redis_key_prefix.clone(),
             }),
         }
     }

@@ -54,7 +54,7 @@ async fn main() -> anyhow::Result<()> {
         &config.r2_secret_access_key,
     )
     .await?;
-    let local_cache = LocalCache::new(config.local_cache.clone()).await;
+    let local_cache = LocalCache::new(config.local_cache.clone(), &config.redis).await;
     info!(
         cloudflare_account_id = %config.cloudflare_account_id,
         cloudflare_kv_namespace_id = %kv_client.namespace_id(),
