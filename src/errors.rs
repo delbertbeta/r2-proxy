@@ -12,6 +12,9 @@ pub enum ProxyError {
     #[error("Unauthorized bucket: {0}")]
     UnauthorizedBucket(String),
 
+    #[error("Object not found: {0}")]
+    ObjectNotFound(String),
+
     #[error("S3 error: {0}")]
     S3Error(#[from] aws_sdk_s3::Error),
 
@@ -32,7 +35,7 @@ impl ProxyError {
     pub fn stats_error_kind(&self) -> &'static str {
         match self {
             Self::UnauthorizedBucket(_) => "unauthorized_bucket",
-            Self::S3Error(_) => "origin",
+            Self::ObjectNotFound(_) | Self::S3Error(_) => "origin",
             Self::InvalidPath(_)
             | Self::HttpError(_)
             | Self::KvError(_)
@@ -50,6 +53,9 @@ impl IntoResponse for ProxyError {
                 StatusCode::FORBIDDEN,
                 format!("Access to bucket denied: {}", bucket),
             ),
+            ProxyError::ObjectNotFound(key) => {
+                (StatusCode::NOT_FOUND, format!("Object not found: {}", key))
+            }
             ProxyError::S3Error(e) => {
                 tracing::error!("S3 error: {}", e);
                 (
@@ -91,6 +97,7 @@ impl IntoResponse for ProxyError {
 #[cfg(test)]
 mod tests {
     use super::ProxyError;
+    use axum::{body, http::StatusCode, response::IntoResponse};
 
     #[test]
     fn classifies_proxy_errors_for_metrics() {
@@ -102,5 +109,17 @@ mod tests {
             ProxyError::InternalError("boom".to_string()).stats_error_kind(),
             "internal"
         );
+    }
+
+    #[tokio::test]
+    async fn maps_missing_origin_objects_to_not_found() {
+        let response = ProxyError::ObjectNotFound("missing.txt".to_string()).into_response();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let body = body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should be readable");
+        assert_eq!(&body[..], b"Object not found: missing.txt");
     }
 }
