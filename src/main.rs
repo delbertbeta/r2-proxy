@@ -11,7 +11,10 @@ use std::collections::HashMap;
 use std::env;
 use std::io;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 use tokio::sync::RwLock;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{error, info, warn};
@@ -34,6 +37,82 @@ struct AppCache {
     whitelist: HashMap<String, String>, // 虚拟名 -> 真实 bucket
     cors_config: HashMap<String, Option<cors::CorsConfig>>,
     spa: HashMap<String, bool>,
+}
+
+#[derive(Default)]
+struct AppMetrics {
+    requests_total: AtomicU64,
+    cache_hit_total: AtomicU64,
+    cache_miss_total: AtomicU64,
+    cache_bypass_total: AtomicU64,
+    cache_disabled_total: AtomicU64,
+    bytes_served_total: AtomicU64,
+    bytes_from_cache_total: AtomicU64,
+    bytes_from_origin_total: AtomicU64,
+}
+
+#[derive(Debug, PartialEq)]
+struct MetricsSnapshot {
+    requests_total: u64,
+    cache_hit_total: u64,
+    cache_miss_total: u64,
+    cache_bypass_total: u64,
+    cache_disabled_total: u64,
+    bytes_served_total: u64,
+    bytes_from_cache_total: u64,
+    bytes_from_origin_total: u64,
+}
+
+#[derive(Clone)]
+struct RequestContext {
+    host: String,
+    virtual_bucket: String,
+    real_bucket: String,
+    object_key: String,
+}
+
+impl AppMetrics {
+    fn record(&self, status: CacheStatus, bytes_served: u64) {
+        self.requests_total.fetch_add(1, Ordering::Relaxed);
+        self.bytes_served_total
+            .fetch_add(bytes_served, Ordering::Relaxed);
+
+        match status {
+            CacheStatus::Hit => {
+                self.cache_hit_total.fetch_add(1, Ordering::Relaxed);
+                self.bytes_from_cache_total
+                    .fetch_add(bytes_served, Ordering::Relaxed);
+            }
+            CacheStatus::Miss => {
+                self.cache_miss_total.fetch_add(1, Ordering::Relaxed);
+                self.bytes_from_origin_total
+                    .fetch_add(bytes_served, Ordering::Relaxed);
+            }
+            CacheStatus::Bypass => {
+                self.cache_bypass_total.fetch_add(1, Ordering::Relaxed);
+                self.bytes_from_origin_total
+                    .fetch_add(bytes_served, Ordering::Relaxed);
+            }
+            CacheStatus::Disabled => {
+                self.cache_disabled_total.fetch_add(1, Ordering::Relaxed);
+                self.bytes_from_origin_total
+                    .fetch_add(bytes_served, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn snapshot(&self) -> MetricsSnapshot {
+        MetricsSnapshot {
+            requests_total: self.requests_total.load(Ordering::Relaxed),
+            cache_hit_total: self.cache_hit_total.load(Ordering::Relaxed),
+            cache_miss_total: self.cache_miss_total.load(Ordering::Relaxed),
+            cache_bypass_total: self.cache_bypass_total.load(Ordering::Relaxed),
+            cache_disabled_total: self.cache_disabled_total.load(Ordering::Relaxed),
+            bytes_served_total: self.bytes_served_total.load(Ordering::Relaxed),
+            bytes_from_cache_total: self.bytes_from_cache_total.load(Ordering::Relaxed),
+            bytes_from_origin_total: self.bytes_from_origin_total.load(Ordering::Relaxed),
+        }
+    }
 }
 
 #[tokio::main]
@@ -67,6 +146,7 @@ async fn main() -> anyhow::Result<()> {
         cors_config: HashMap::new(),
         spa: HashMap::new(),
     }));
+    let metrics = Arc::new(AppMetrics::default());
 
     // 初始化缓存（同步拉取一次）
     refresh_cache(&kv_client, &cache).await?;
@@ -89,6 +169,7 @@ async fn main() -> anyhow::Result<()> {
             s3_client,
             local_cache,
             cache: cache.clone(),
+            metrics,
         });
 
     // Start refresh task
@@ -118,6 +199,7 @@ struct AppState {
     s3_client: S3Client,
     local_cache: LocalCache,
     cache: Arc<RwLock<AppCache>>,
+    metrics: Arc<AppMetrics>,
 }
 
 async fn proxy_handler(
@@ -182,22 +264,43 @@ async fn proxy_handler(
             return Err(ProxyError::UnauthorizedBucket(bucket.to_string()));
         }
     };
+    let request_context = RequestContext {
+        host: host.clone(),
+        virtual_bucket: bucket.to_string(),
+        real_bucket: real_bucket.clone(),
+        object_key: object_key.clone(),
+    };
 
     let (cache_status, body, cached_headers) =
         match state.local_cache.get(&real_bucket, &object_key).await? {
-            (CacheStatus::Hit, Some(cached_response)) => (
-                CacheStatus::Hit,
-                Body::from(cached_response.body),
-                cached_response.headers,
-            ),
+            (CacheStatus::Hit, Some(cached_response)) => {
+                let bytes_served = cached_response.body.len() as u64;
+                state.metrics.record(CacheStatus::Hit, bytes_served);
+                info!(
+                    host = %request_context.host,
+                    virtual_bucket = %request_context.virtual_bucket,
+                    real_bucket = %request_context.real_bucket,
+                    object_key = %request_context.object_key,
+                    cache_status = %CacheStatus::Hit.header_value(),
+                    bytes_served,
+                    status = %StatusCode::OK,
+                    "request served successfully"
+                );
+
+                (
+                    CacheStatus::Hit,
+                    Body::from(cached_response.body),
+                    cached_response.headers,
+                )
+            }
             (lookup_status, _) => {
                 let s3_response = state
                     .s3_client
                     .get_object(&real_bucket, &object_key)
                     .await?;
-                let (response_status, pending_write) =
+                let pending_write =
                     if matches!(lookup_status, CacheStatus::Disabled | CacheStatus::Bypass) {
-                        (lookup_status, None)
+                        None
                     } else {
                         state
                             .local_cache
@@ -208,11 +311,19 @@ async fn proxy_handler(
                                 s3_response.headers.clone(),
                             )
                             .await?
+                            .1
                     };
+                let response_status = response_cache_status(lookup_status);
 
                 (
                     response_status,
-                    Body::from_stream(stream_origin_body(s3_response.body, pending_write)),
+                    Body::from_stream(stream_origin_body(
+                        s3_response.body,
+                        pending_write,
+                        state.metrics.clone(),
+                        request_context.clone(),
+                        response_status,
+                    )),
                     s3_response.headers,
                 )
             }
@@ -264,15 +375,6 @@ async fn proxy_handler(
     if let Some(cors) = cors_config {
         cors.apply_headers(response.headers_mut());
     }
-
-    info!(
-        host = %host,
-        virtual_bucket = bucket,
-        real_bucket = %real_bucket,
-        object_key = %object_key,
-        status = %StatusCode::OK,
-        "request served successfully"
-    );
 
     Ok(response)
 }
@@ -364,13 +466,26 @@ fn apply_cache_status_header(headers: &mut HeaderMap, status: CacheStatus) {
     );
 }
 
+fn response_cache_status(lookup_status: CacheStatus) -> CacheStatus {
+    match lookup_status {
+        CacheStatus::Hit => CacheStatus::Hit,
+        CacheStatus::Miss => CacheStatus::Miss,
+        CacheStatus::Bypass => CacheStatus::Bypass,
+        CacheStatus::Disabled => CacheStatus::Disabled,
+    }
+}
+
 fn stream_origin_body(
     upstream_body: aws_sdk_s3::primitives::ByteStream,
     pending_write: Option<PendingCacheWrite>,
+    metrics: Arc<AppMetrics>,
+    request_context: RequestContext,
+    cache_status: CacheStatus,
 ) -> impl futures_util::Stream<Item = Result<Bytes, io::Error>> {
     try_stream! {
         let mut upstream_body = upstream_body;
         let mut pending_write = pending_write;
+        let mut bytes_served = 0_u64;
 
         loop {
             let next_chunk = match upstream_body.try_next().await {
@@ -397,6 +512,7 @@ fn stream_origin_body(
                 }
             }
 
+            bytes_served = bytes_served.saturating_add(chunk.len() as u64);
             yield chunk;
         }
 
@@ -405,6 +521,18 @@ fn stream_origin_body(
                 warn!(error = %error, "stream cache commit failed");
             }
         }
+
+        metrics.record(cache_status, bytes_served);
+        info!(
+            host = %request_context.host,
+            virtual_bucket = %request_context.virtual_bucket,
+            real_bucket = %request_context.real_bucket,
+            object_key = %request_context.object_key,
+            cache_status = %cache_status.header_value(),
+            bytes_served,
+            status = %StatusCode::OK,
+            "request served successfully"
+        );
     }
 }
 
@@ -412,6 +540,7 @@ fn stream_origin_body(
 mod tests {
     use super::*;
     use axum::http::{header::CACHE_CONTROL, HeaderMap};
+    use std::sync::Arc;
 
     #[test]
     fn default_log_filter_is_info() {
@@ -488,6 +617,40 @@ mod tests {
         apply_cache_status_header(&mut headers, CacheStatus::Hit);
 
         assert_eq!(headers.get("x-r2-proxy-cached").unwrap(), "HIT");
+    }
+
+    #[test]
+    fn lookup_miss_stays_miss_even_without_cache_fill() {
+        assert_eq!(response_cache_status(CacheStatus::Miss), CacheStatus::Miss);
+        assert_eq!(
+            response_cache_status(CacheStatus::Bypass),
+            CacheStatus::Bypass
+        );
+        assert_eq!(
+            response_cache_status(CacheStatus::Disabled),
+            CacheStatus::Disabled
+        );
+    }
+
+    #[test]
+    fn metrics_snapshot_tracks_status_and_bytes() {
+        let metrics = Arc::new(AppMetrics::default());
+
+        metrics.record(CacheStatus::Hit, 10);
+        metrics.record(CacheStatus::Miss, 20);
+        metrics.record(CacheStatus::Bypass, 30);
+        metrics.record(CacheStatus::Disabled, 40);
+
+        let snapshot = metrics.snapshot();
+
+        assert_eq!(snapshot.requests_total, 4);
+        assert_eq!(snapshot.cache_hit_total, 1);
+        assert_eq!(snapshot.cache_miss_total, 1);
+        assert_eq!(snapshot.cache_bypass_total, 1);
+        assert_eq!(snapshot.cache_disabled_total, 1);
+        assert_eq!(snapshot.bytes_served_total, 100);
+        assert_eq!(snapshot.bytes_from_cache_total, 10);
+        assert_eq!(snapshot.bytes_from_origin_total, 90);
     }
 }
 
