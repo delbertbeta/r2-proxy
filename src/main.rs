@@ -23,6 +23,7 @@ mod errors;
 mod kv_client;
 mod local_cache;
 mod s3_client;
+mod stats;
 
 use config::Config;
 use errors::ProxyError;
