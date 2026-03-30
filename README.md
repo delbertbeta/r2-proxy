@@ -1,9 +1,3 @@
----
-title: README
-type: note
-permalink: work/r2-proxy/readme
----
-
 # R2 代理服务器
 
 一个高性能的 Rust S3 代理服务器，用于代理 Cloudflare R2 存储的请求。
