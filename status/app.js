@@ -5,6 +5,7 @@ const state = {
   range: "1h",
   bucket: "",
 };
+const chartInstances = [];
 
 const loginPanel = document.getElementById("login-panel");
 const dashboard = document.getElementById("dashboard");
@@ -80,11 +81,13 @@ async function login(apiKey) {
 }
 
 function showLogin() {
+  document.body.dataset.view = "login";
   loginPanel.hidden = false;
   dashboard.hidden = true;
 }
 
 function showDashboard() {
+  document.body.dataset.view = "dashboard";
   loginPanel.hidden = true;
   dashboard.hidden = false;
 }
@@ -123,27 +126,12 @@ function renderSummary(summary) {
     `).join("");
 }
 
-function linePath(points, width, height) {
-  const max = Math.max(...points.map((point) => point.value), 1);
-  const min = Math.min(...points.map((point) => point.value), 0);
-  const xStep = points.length > 1 ? width / (points.length - 1) : width;
-  return points.map((point, index) => {
-    const x = index * xStep;
-    const normalized = max === min ? 0.5 : (point.value - min) / (max - min);
-    const y = height - normalized * height;
-    return `${index === 0 ? "M" : "L"} ${x.toFixed(2)} ${y.toFixed(2)}`;
-  }).join(" ");
-}
-
-function renderChart(title, color, points, formatter) {
-  const path = linePath(points, 520, 180);
+function chartCardMarkup(id, title, points, formatter) {
   const values = points.map((point) => point.value);
   return `
     <article class="chart-card">
       <p class="metric-label">${title}</p>
-      <svg viewBox="0 0 520 180" preserveAspectRatio="none" aria-hidden="true">
-        <path d="${path}" fill="none" stroke="${color}" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"></path>
-      </svg>
+      <div id="${id}" class="chart-canvas"></div>
       <footer>
         <span>min ${formatter(Math.min(...values, 0))}</span>
         <span>max ${formatter(Math.max(...values, 0))}</span>
@@ -153,12 +141,109 @@ function renderChart(title, color, points, formatter) {
 }
 
 function renderCharts(series) {
+  chartInstances.splice(0).forEach((chart) => chart.destroy());
   charts.innerHTML = [
-    renderChart("QPS", "#b46a1c", series.qps, (value) => value.toFixed(2)),
-    renderChart("Throughput", "#1f8f68", series.throughputBytesPerSec, (value) => formatBytes(value)),
-    renderChart("Cache Hit Rate", "#182126", series.cacheHitRate, formatRate),
-    renderChart("Error Rate", "#b4432f", series.errorRate, formatRate),
+    chartCardMarkup("chart-qps", "QPS", series.qps, (value) => value.toFixed(2)),
+    chartCardMarkup("chart-throughput", "Throughput", series.throughputBytesPerSec, (value) => formatBytes(value)),
+    chartCardMarkup("chart-hit-rate", "Cache Hit Rate", series.cacheHitRate, formatRate),
+    chartCardMarkup("chart-error-rate", "Error Rate", series.errorRate, formatRate),
   ].join("");
+
+  [
+    {
+      id: "chart-qps",
+      color: "#b46a1c",
+      points: series.qps,
+      formatter: (value) => value.toFixed(2),
+    },
+    {
+      id: "chart-throughput",
+      color: "#1f8f68",
+      points: series.throughputBytesPerSec,
+      formatter: (value) => formatBytes(value),
+    },
+    {
+      id: "chart-hit-rate",
+      color: "#182126",
+      points: series.cacheHitRate,
+      formatter: formatRate,
+    },
+    {
+      id: "chart-error-rate",
+      color: "#b4432f",
+      points: series.errorRate,
+      formatter: formatRate,
+    },
+  ].forEach(({ id, color, points, formatter }) => {
+    if (!window.ApexCharts) {
+      return;
+    }
+
+    const chart = new window.ApexCharts(document.getElementById(id), {
+      chart: {
+        type: "line",
+        height: 240,
+        toolbar: { show: false },
+        zoom: { enabled: false },
+        animations: { easing: "easeinout", speed: 260 },
+        sparkline: { enabled: false },
+        fontFamily: '"IBM Plex Mono", monospace',
+      },
+      series: [
+        {
+          name: id,
+          data: points.map((point) => ({ x: point.ts * 1000, y: point.value })),
+        },
+      ],
+      colors: [color],
+      stroke: {
+        curve: "smooth",
+        width: 3,
+      },
+      grid: {
+        borderColor: "rgba(24, 33, 38, 0.08)",
+        strokeDashArray: 4,
+      },
+      markers: {
+        size: 0,
+        hover: { size: 4 },
+      },
+      tooltip: {
+        theme: "light",
+        x: {
+          format: state.range === "1h" ? "HH:mm" : state.range === "24h" ? "MM-dd HH:mm" : "yyyy-MM-dd",
+        },
+        y: {
+          formatter,
+        },
+      },
+      xaxis: {
+        type: "datetime",
+        labels: {
+          datetimeUTC: false,
+          style: {
+            colors: "#5a666f",
+          },
+        },
+        axisBorder: { show: false },
+        axisTicks: { show: false },
+      },
+      yaxis: {
+        labels: {
+          formatter,
+          style: {
+            colors: "#5a666f",
+          },
+        },
+      },
+      dataLabels: { enabled: false },
+      legend: { show: false },
+      theme: { mode: "light" },
+    });
+
+    chart.render();
+    chartInstances.push(chart);
+  });
 }
 
 function renderTable(target, rows, valueKey) {
