@@ -28,6 +28,20 @@ pub enum ProxyError {
     InternalError(String),
 }
 
+impl ProxyError {
+    pub fn stats_error_kind(&self) -> &'static str {
+        match self {
+            Self::UnauthorizedBucket(_) => "unauthorized_bucket",
+            Self::S3Error(_) => "origin",
+            Self::InvalidPath(_)
+            | Self::HttpError(_)
+            | Self::KvError(_)
+            | Self::ConfigError(_)
+            | Self::InternalError(_) => "internal",
+        }
+    }
+}
+
 impl IntoResponse for ProxyError {
     fn into_response(self) -> Response {
         let (status, message) = match self {
@@ -71,5 +85,22 @@ impl IntoResponse for ProxyError {
         };
 
         (status, message).into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ProxyError;
+
+    #[test]
+    fn classifies_proxy_errors_for_metrics() {
+        assert_eq!(
+            ProxyError::UnauthorizedBucket("foo".to_string()).stats_error_kind(),
+            "unauthorized_bucket"
+        );
+        assert_eq!(
+            ProxyError::InternalError("boom".to_string()).stats_error_kind(),
+            "internal"
+        );
     }
 }
