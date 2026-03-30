@@ -60,6 +60,8 @@ pub struct BucketTotals {
     pub cache_hits: u64,
     pub cache_misses: u64,
     pub errors: u64,
+    pub not_found_errors: u64,
+    pub server_errors: u64,
 }
 
 impl BucketTotals {
@@ -77,6 +79,22 @@ impl BucketTotals {
             0.0
         } else {
             self.errors as f64 / self.requests as f64
+        }
+    }
+
+    pub fn not_found_error_rate(self) -> f64 {
+        if self.requests == 0 {
+            0.0
+        } else {
+            self.not_found_errors as f64 / self.requests as f64
+        }
+    }
+
+    pub fn server_error_rate(self) -> f64 {
+        if self.requests == 0 {
+            0.0
+        } else {
+            self.server_errors as f64 / self.requests as f64
         }
     }
 
@@ -114,7 +132,22 @@ impl StatsCacheStatus {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StatsResult {
     Success,
-    Error,
+    NotFound,
+    ServerError,
+}
+
+impl StatsResult {
+    pub fn is_error(self) -> bool {
+        !matches!(self, Self::Success)
+    }
+
+    pub fn is_not_found(self) -> bool {
+        matches!(self, Self::NotFound)
+    }
+
+    pub fn is_server_error(self) -> bool {
+        matches!(self, Self::ServerError)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -198,13 +231,23 @@ impl StatsStore {
             .await
     }
 
-    pub async fn read_top_errors(
+    pub async fn read_top_not_found_errors(
         &self,
         scope: &StatsScope,
         end_timestamp: u64,
         limit: usize,
     ) -> Result<Vec<(String, u64)>, redis::RedisError> {
-        self.read_recent_top_entries("errors", scope, end_timestamp, limit)
+        self.read_recent_top_entries("errors_404", scope, end_timestamp, limit)
+            .await
+    }
+
+    pub async fn read_top_server_errors(
+        &self,
+        scope: &StatsScope,
+        end_timestamp: u64,
+        limit: usize,
+    ) -> Result<Vec<(String, u64)>, redis::RedisError> {
+        self.read_recent_top_entries("errors_5xx", scope, end_timestamp, limit)
             .await
     }
 
@@ -252,11 +295,15 @@ impl StatsStore {
                 .cmd("HINCRBY")
                 .arg(&totals_key)
                 .arg("errors")
-                .arg(if matches!(event.result, StatsResult::Error) {
-                    1
-                } else {
-                    0
-                })
+                .arg(if event.result.is_error() { 1 } else { 0 })
+                .cmd("HINCRBY")
+                .arg(&totals_key)
+                .arg("errors_404")
+                .arg(if event.result.is_not_found() { 1 } else { 0 })
+                .cmd("HINCRBY")
+                .arg(&totals_key)
+                .arg("errors_5xx")
+                .arg(if event.result.is_server_error() { 1 } else { 0 })
                 .query_async(&mut connection)
                 .await?;
 
@@ -298,11 +345,15 @@ impl StatsStore {
                     .cmd("HINCRBY")
                     .arg(&series_key)
                     .arg("errors")
-                    .arg(if matches!(event.result, StatsResult::Error) {
-                        1
-                    } else {
-                        0
-                    })
+                    .arg(if event.result.is_error() { 1 } else { 0 })
+                    .cmd("HINCRBY")
+                    .arg(&series_key)
+                    .arg("errors_404")
+                    .arg(if event.result.is_not_found() { 1 } else { 0 })
+                    .cmd("HINCRBY")
+                    .arg(&series_key)
+                    .arg("errors_5xx")
+                    .arg(if event.result.is_server_error() { 1 } else { 0 })
                     .cmd("EXPIRE")
                     .arg(&series_key)
                     .arg(resolution.ttl_seconds())
@@ -329,8 +380,16 @@ impl StatsStore {
                         .expire(&key, Resolution::OneDay.ttl_seconds())
                         .await?;
                 }
-                StatsResult::Error => {
-                    let key = self.daily_top_errors_key(&scope, event.timestamp);
+                result if result.is_not_found() => {
+                    let key = self.daily_top_not_found_errors_key(&scope, event.timestamp);
+                    let member = format!("{}|{}", event.bucket, event.path_and_query);
+                    let _: f64 = connection.zincr(&key, member, 1).await?;
+                    let _: bool = connection
+                        .expire(&key, Resolution::OneDay.ttl_seconds())
+                        .await?;
+                }
+                result if result.is_server_error() => {
+                    let key = self.daily_top_server_errors_key(&scope, event.timestamp);
                     let member = format!("{}|{}", event.bucket, event.path_and_query);
                     let _: f64 = connection.zincr(&key, member, 1).await?;
                     let _: bool = connection
@@ -424,6 +483,24 @@ impl StatsStore {
             day_stamp(timestamp)
         )
     }
+
+    pub fn daily_top_not_found_errors_key(&self, scope: &StatsScope, timestamp: u64) -> String {
+        format!(
+            "{}:stats:top:errors_404:{}:{}",
+            self.key_prefix,
+            scope.redis_key(),
+            day_stamp(timestamp)
+        )
+    }
+
+    pub fn daily_top_server_errors_key(&self, scope: &StatsScope, timestamp: u64) -> String {
+        format!(
+            "{}:stats:top:errors_5xx:{}:{}",
+            self.key_prefix,
+            scope.redis_key(),
+            day_stamp(timestamp)
+        )
+    }
 }
 
 pub fn bucket_start(timestamp: u64, resolution: Resolution) -> u64 {
@@ -446,6 +523,8 @@ fn bucket_totals_from_hash(values: HashMap<String, u64>) -> BucketTotals {
         cache_hits: values.get("cache_hits").copied().unwrap_or(0),
         cache_misses: values.get("cache_misses").copied().unwrap_or(0),
         errors: values.get("errors").copied().unwrap_or(0),
+        not_found_errors: values.get("errors_404").copied().unwrap_or(0),
+        server_errors: values.get("errors_5xx").copied().unwrap_or(0),
     }
 }
 
@@ -515,7 +594,22 @@ mod tests {
 
         assert_eq!(totals.cache_hit_rate(), 0.0);
         assert_eq!(totals.error_rate(), 0.0);
+        assert_eq!(totals.not_found_error_rate(), 0.0);
+        assert_eq!(totals.server_error_rate(), 0.0);
         assert_eq!(totals.qps(300), 0.0);
+    }
+
+    #[test]
+    fn stats_results_report_404_and_5xx_buckets() {
+        assert!(StatsResult::NotFound.is_error());
+        assert!(StatsResult::NotFound.is_not_found());
+        assert!(!StatsResult::NotFound.is_server_error());
+
+        assert!(StatsResult::ServerError.is_error());
+        assert!(!StatsResult::ServerError.is_not_found());
+        assert!(StatsResult::ServerError.is_server_error());
+
+        assert!(!StatsResult::Success.is_error());
     }
 
     #[test]
@@ -548,6 +642,14 @@ mod tests {
             store.daily_top_errors_key(&scope, 1_711_753_499),
             "r2proxy:stats:top:errors:bucket:foo:2024_03_29"
         );
+        assert_eq!(
+            store.daily_top_not_found_errors_key(&scope, 1_711_753_499),
+            "r2proxy:stats:top:errors_404:bucket:foo:2024_03_29"
+        );
+        assert_eq!(
+            store.daily_top_server_errors_key(&scope, 1_711_753_499),
+            "r2proxy:stats:top:errors_5xx:bucket:foo:2024_03_29"
+        );
     }
 
     #[test]
@@ -562,5 +664,33 @@ mod tests {
         assert_eq!(keys.len(), 7);
         assert_eq!(keys[0], "r2proxy:stats:top:errors:bucket:foo:2024_03_29");
         assert_eq!(keys[6], "r2proxy:stats:top:errors:bucket:foo:2024_03_23");
+    }
+
+    #[test]
+    fn bucket_totals_defaults_new_error_counters_to_zero() {
+        let totals = bucket_totals_from_hash(HashMap::new());
+
+        assert_eq!(totals.errors, 0);
+        assert_eq!(totals.not_found_errors, 0);
+        assert_eq!(totals.server_errors, 0);
+    }
+
+    #[test]
+    fn builds_daily_top_error_keys_for_404_and_5xx() {
+        let redis = RedisConfig {
+            redis_url: "redis://127.0.0.1:6379".to_string(),
+            redis_key_prefix: "r2proxy".to_string(),
+        };
+        let store = StatsStore::new(&redis).expect("stats store");
+        let scope = StatsScope::Bucket("foo".to_string());
+
+        assert_eq!(
+            store.daily_top_not_found_errors_key(&scope, 1_711_753_499),
+            "r2proxy:stats:top:errors_404:bucket:foo:2024_03_29"
+        );
+        assert_eq!(
+            store.daily_top_server_errors_key(&scope, 1_711_753_499),
+            "r2proxy:stats:top:errors_5xx:bucket:foo:2024_03_29"
+        );
     }
 }

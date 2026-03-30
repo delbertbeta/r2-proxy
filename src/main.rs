@@ -157,7 +157,13 @@ async fn proxy_handler(
     info!(host = %host, path = %uri.path(), virtual_bucket = bucket, "incoming request");
     if bucket.is_empty() {
         let error = ProxyError::InvalidPath("Bucket not found in host".to_string());
-        record_error_event(&state, bucket, request_path_and_query.clone()).await;
+        record_error_event(
+            &state,
+            bucket,
+            request_path_and_query.clone(),
+            error.stats_result(),
+        )
+        .await;
         return Err(error);
     }
     let (real_bucket, cors_config, spa_enabled) = {
@@ -208,7 +214,13 @@ async fn proxy_handler(
                 "access to bucket denied because whitelist lookup failed"
             );
             let error = ProxyError::UnauthorizedBucket(bucket.to_string());
-            record_error_event(&state, bucket, request_path_and_query.clone()).await;
+            record_error_event(
+                &state,
+                bucket,
+                request_path_and_query.clone(),
+                error.stats_result(),
+            )
+            .await;
             return Err(error);
         }
     };
@@ -225,7 +237,14 @@ async fn proxy_handler(
                     let s3_response = match state.s3_client.get_object(&real_bucket, &object_key).await {
                         Ok(response) => response,
                         Err(error) => {
-                            record_error_event(&state, bucket, request_path_and_query.clone()).await;
+                            let stats_result = error.stats_result();
+                            record_error_event(
+                                &state,
+                                bucket,
+                                request_path_and_query.clone(),
+                                stats_result,
+                            )
+                            .await;
                             return Err(error);
                         }
                     };
@@ -245,7 +264,14 @@ async fn proxy_handler(
                             {
                                 Ok(result) => result,
                                 Err(error) => {
-                                    record_error_event(&state, bucket, request_path_and_query.clone()).await;
+                                    let stats_result = error.stats_result();
+                                    record_error_event(
+                                        &state,
+                                        bucket,
+                                        request_path_and_query.clone(),
+                                        stats_result,
+                                    )
+                                    .await;
                                     return Err(error);
                                 }
                             }
@@ -270,7 +296,14 @@ async fn proxy_handler(
                 }
             },
             Err(error) => {
-                record_error_event(&state, bucket, request_path_and_query.clone()).await;
+                let stats_result = error.stats_result();
+                record_error_event(
+                    &state,
+                    bucket,
+                    request_path_and_query.clone(),
+                    stats_result,
+                )
+                .await;
                 return Err(error);
             }
         };
@@ -481,7 +514,12 @@ struct StreamStatsContext {
     cache_status: StatsCacheStatus,
 }
 
-async fn record_error_event(state: &AppState, bucket: &str, path_and_query: String) {
+async fn record_error_event(
+    state: &AppState,
+    bucket: &str,
+    path_and_query: String,
+    result: StatsResult,
+) {
     state
         .stats_store
         .record(StatsEvent {
@@ -491,7 +529,7 @@ async fn record_error_event(state: &AppState, bucket: &str, path_and_query: Stri
             object_key: None,
             bytes: 0,
             cache_status: StatsCacheStatus::Disabled,
-            result: StatsResult::Error,
+            result,
         })
         .await;
 }
@@ -522,7 +560,7 @@ fn stream_origin_body(
                             object_key: context.object_key,
                             bytes: 0,
                             cache_status: context.cache_status,
-                            result: StatsResult::Error,
+                            result: StatsResult::ServerError,
                         }).await;
                     }
                     Err(io::Error::other(format!("failed to read s3 stream: {error}")))?;

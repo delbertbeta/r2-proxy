@@ -78,6 +78,14 @@ struct TotalsResponse {
     errors: u64,
     #[serde(rename = "errorRate")]
     error_rate: f64,
+    #[serde(rename = "notFoundErrors")]
+    not_found_errors: u64,
+    #[serde(rename = "notFoundErrorRate")]
+    not_found_error_rate: f64,
+    #[serde(rename = "serverErrors")]
+    server_errors: u64,
+    #[serde(rename = "serverErrorRate")]
+    server_error_rate: f64,
 }
 
 #[derive(Serialize)]
@@ -119,6 +127,14 @@ struct SummaryResponse {
     errors: u64,
     #[serde(rename = "errorRate")]
     error_rate: f64,
+    #[serde(rename = "notFoundErrors")]
+    not_found_errors: u64,
+    #[serde(rename = "notFoundErrorRate")]
+    not_found_error_rate: f64,
+    #[serde(rename = "serverErrors")]
+    server_errors: u64,
+    #[serde(rename = "serverErrorRate")]
+    server_error_rate: f64,
 }
 
 #[derive(Serialize)]
@@ -136,6 +152,10 @@ struct SeriesResponse {
     cache_hit_rate: Vec<DataPoint>,
     #[serde(rename = "errorRate")]
     error_rate: Vec<DataPoint>,
+    #[serde(rename = "notFoundErrorRate")]
+    not_found_error_rate: Vec<DataPoint>,
+    #[serde(rename = "serverErrorRate")]
+    server_error_rate: Vec<DataPoint>,
 }
 
 #[derive(Serialize)]
@@ -171,8 +191,10 @@ struct TopResponse {
     hot_cache_files: Vec<CacheFileEntry>,
     #[serde(rename = "missUrls")]
     miss_urls: Vec<UrlMetricEntry>,
-    #[serde(rename = "errorUrls")]
-    error_urls: Vec<UrlMetricEntry>,
+    #[serde(rename = "notFoundUrls")]
+    not_found_urls: Vec<UrlMetricEntry>,
+    #[serde(rename = "serverErrorUrls")]
+    server_error_urls: Vec<UrlMetricEntry>,
 }
 
 async fn serve_index() -> impl IntoResponse {
@@ -270,6 +292,8 @@ async fn timeseries(
                     acc.cache_hits += totals.cache_hits;
                     acc.cache_misses += totals.cache_misses;
                     acc.errors += totals.errors;
+                    acc.not_found_errors += totals.not_found_errors;
+                    acc.server_errors += totals.server_errors;
                     acc
                 });
 
@@ -284,6 +308,10 @@ async fn timeseries(
                     cache_hit_rate: summary.cache_hit_rate(),
                     errors: summary.errors,
                     error_rate: summary.error_rate(),
+                    not_found_errors: summary.not_found_errors,
+                    not_found_error_rate: summary.not_found_error_rate(),
+                    server_errors: summary.server_errors,
+                    server_error_rate: summary.server_error_rate(),
                 },
                 series: SeriesResponse {
                     qps: series
@@ -314,6 +342,20 @@ async fn timeseries(
                             value: totals.error_rate(),
                         })
                         .collect(),
+                    not_found_error_rate: series
+                        .iter()
+                        .map(|(ts, totals)| DataPoint {
+                            ts: *ts,
+                            value: totals.not_found_error_rate(),
+                        })
+                        .collect(),
+                    server_error_rate: series
+                        .iter()
+                        .map(|(ts, totals)| DataPoint {
+                            ts: *ts,
+                            value: totals.server_error_rate(),
+                        })
+                        .collect(),
                 },
             };
 
@@ -341,9 +383,10 @@ async fn top(
     match (
         state.stats_store.read_top_hits(&scope, now, 10).await,
         state.stats_store.read_top_misses(&scope, now, 10).await,
-        state.stats_store.read_top_errors(&scope, now, 10).await,
+        state.stats_store.read_top_not_found_errors(&scope, now, 10).await,
+        state.stats_store.read_top_server_errors(&scope, now, 10).await,
     ) {
-        (Ok(hits), Ok(misses), Ok(errors)) => no_store(Json(TopResponse {
+        (Ok(hits), Ok(misses), Ok(not_found_errors), Ok(server_errors)) => no_store(Json(TopResponse {
             scope: scope.redis_key(),
             window: "7d".to_string(),
             hot_cache_files: hits
@@ -367,7 +410,18 @@ async fn top(
                     })
                 })
                 .collect(),
-            error_urls: errors
+            not_found_urls: not_found_errors
+                .into_iter()
+                .filter_map(|(member, count)| {
+                    split_member(&member).map(|(bucket, url)| UrlMetricEntry {
+                        bucket,
+                        url,
+                        misses: None,
+                        errors: Some(count),
+                    })
+                })
+                .collect(),
+            server_error_urls: server_errors
                 .into_iter()
                 .filter_map(|(member, count)| {
                     split_member(&member).map(|(bucket, url)| UrlMetricEntry {
@@ -416,6 +470,10 @@ fn totals_response(totals: BucketTotals) -> TotalsResponse {
         cache_hit_rate: totals.cache_hit_rate(),
         errors: totals.errors,
         error_rate: totals.error_rate(),
+        not_found_errors: totals.not_found_errors,
+        not_found_error_rate: totals.not_found_error_rate(),
+        server_errors: totals.server_errors,
+        server_error_rate: totals.server_error_rate(),
     }
 }
 
@@ -468,6 +526,7 @@ fn unix_timestamp() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
     use axum::http::Request;
     use tower::Service;
 
@@ -523,5 +582,62 @@ mod tests {
             response.headers().get(header::CONTENT_TYPE).unwrap(),
             "text/html; charset=utf-8"
         );
+    }
+
+    #[test]
+    fn totals_response_includes_404_and_5xx_fields() {
+        let totals = BucketTotals {
+            requests: 100,
+            bytes: 2048,
+            cache_hits: 40,
+            cache_misses: 10,
+            errors: 7,
+            not_found_errors: 5,
+            server_errors: 2,
+        };
+
+        let body = serde_json::to_value(totals_response(totals)).expect("json");
+
+        assert_eq!(
+            body,
+            json!({
+                "requests": 100,
+                "bytes": 2048,
+                "cacheHitRate": 0.8,
+                "errors": 7,
+                "errorRate": 0.07,
+                "notFoundErrors": 5,
+                "notFoundErrorRate": 0.05,
+                "serverErrors": 2,
+                "serverErrorRate": 0.02
+            })
+        );
+    }
+
+    #[test]
+    fn top_response_serializes_split_error_lists() {
+        let response = TopResponse {
+            scope: "global".to_string(),
+            window: "7d".to_string(),
+            hot_cache_files: Vec::new(),
+            miss_urls: Vec::new(),
+            not_found_urls: vec![UrlMetricEntry {
+                bucket: "bucket-a".to_string(),
+                url: "/missing".to_string(),
+                misses: None,
+                errors: Some(3),
+            }],
+            server_error_urls: vec![UrlMetricEntry {
+                bucket: "bucket-b".to_string(),
+                url: "/broken".to_string(),
+                misses: None,
+                errors: Some(2),
+            }],
+        };
+
+        let body = serde_json::to_value(response).expect("json");
+
+        assert_eq!(body["notFoundUrls"][0]["url"], "/missing");
+        assert_eq!(body["serverErrorUrls"][0]["url"], "/broken");
     }
 }

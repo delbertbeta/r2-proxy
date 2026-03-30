@@ -32,6 +32,19 @@ pub enum ProxyError {
 }
 
 impl ProxyError {
+    pub fn stats_result(&self) -> crate::stats::StatsResult {
+        match self {
+            Self::ObjectNotFound(_) => crate::stats::StatsResult::NotFound,
+            Self::UnauthorizedBucket(_)
+            | Self::S3Error(_)
+            | Self::InvalidPath(_)
+            | Self::HttpError(_)
+            | Self::KvError(_)
+            | Self::ConfigError(_)
+            | Self::InternalError(_) => crate::stats::StatsResult::ServerError,
+        }
+    }
+
     pub fn stats_error_kind(&self) -> &'static str {
         match self {
             Self::UnauthorizedBucket(_) => "unauthorized_bucket",
@@ -97,6 +110,7 @@ impl IntoResponse for ProxyError {
 #[cfg(test)]
 mod tests {
     use super::ProxyError;
+    use crate::stats::StatsResult;
     use axum::{body, http::StatusCode, response::IntoResponse};
 
     #[test]
@@ -108,6 +122,18 @@ mod tests {
         assert_eq!(
             ProxyError::InternalError("boom".to_string()).stats_error_kind(),
             "internal"
+        );
+    }
+
+    #[test]
+    fn classifies_proxy_errors_for_stats_breakdown() {
+        assert_eq!(
+            ProxyError::ObjectNotFound("missing.txt".to_string()).stats_result(),
+            StatsResult::NotFound
+        );
+        assert_eq!(
+            ProxyError::InternalError("boom".to_string()).stats_result(),
+            StatsResult::ServerError
         );
     }
 
