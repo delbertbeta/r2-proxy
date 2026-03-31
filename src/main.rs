@@ -234,23 +234,24 @@ async fn proxy_handler(
                     cached_response.headers,
                 ),
                 (lookup_status, _) => {
-                    let s3_response = match state.s3_client.get_object(&real_bucket, &object_key).await {
-                        Ok(response) => response,
-                        Err(error) => {
-                            let stats_result = error.stats_result();
-                            record_error_event(
-                                &state,
-                                bucket,
-                                request_path_and_query.clone(),
-                                stats_result,
-                            )
-                            .await;
-                            return Err(error);
-                        }
-                    };
-                    let (response_status, pending_write) =
+                    let s3_response =
+                        match state.s3_client.get_object(&real_bucket, &object_key).await {
+                            Ok(response) => response,
+                            Err(error) => {
+                                let stats_result = error.stats_result();
+                                record_error_event(
+                                    &state,
+                                    bucket,
+                                    request_path_and_query.clone(),
+                                    stats_result,
+                                )
+                                .await;
+                                return Err(error);
+                            }
+                        };
+                    let pending_write =
                         if matches!(lookup_status, CacheStatus::Disabled | CacheStatus::Bypass) {
-                            (lookup_status, None)
+                            None
                         } else {
                             match state
                                 .local_cache
@@ -262,7 +263,7 @@ async fn proxy_handler(
                                 )
                                 .await
                             {
-                                Ok(result) => result,
+                                Ok((_, pending_write)) => pending_write,
                                 Err(error) => {
                                     let stats_result = error.stats_result();
                                     record_error_event(
@@ -276,6 +277,7 @@ async fn proxy_handler(
                                 }
                             }
                         };
+                    let response_status = response_cache_status(lookup_status);
 
                     (
                         response_status,
@@ -288,6 +290,7 @@ async fn proxy_handler(
                                 bucket: bucket.to_string(),
                                 path_and_query: request_path_and_query.clone(),
                                 object_key: Some(object_key.clone()),
+                                expected_bytes: s3_response.headers.content_length,
                                 cache_status: stats_cache_status(response_status),
                             }),
                         )),
@@ -297,13 +300,8 @@ async fn proxy_handler(
             },
             Err(error) => {
                 let stats_result = error.stats_result();
-                record_error_event(
-                    &state,
-                    bucket,
-                    request_path_and_query.clone(),
-                    stats_result,
-                )
-                .await;
+                record_error_event(&state, bucket, request_path_and_query.clone(), stats_result)
+                    .await;
                 return Err(error);
             }
         };
@@ -484,6 +482,15 @@ fn apply_cache_status_header(headers: &mut HeaderMap, status: CacheStatus) {
     );
 }
 
+fn response_cache_status(lookup_status: CacheStatus) -> CacheStatus {
+    match lookup_status {
+        CacheStatus::Hit => CacheStatus::Hit,
+        CacheStatus::Miss => CacheStatus::Miss,
+        CacheStatus::Bypass => CacheStatus::Bypass,
+        CacheStatus::Disabled => CacheStatus::Disabled,
+    }
+}
+
 fn stats_cache_status(status: CacheStatus) -> StatsCacheStatus {
     match status {
         CacheStatus::Hit => StatsCacheStatus::Hit,
@@ -504,6 +511,12 @@ fn successful_response_bytes(
     }
 }
 
+fn should_record_stream_success(expected_bytes: Option<u64>, streamed_bytes: u64) -> bool {
+    expected_bytes
+        .map(|expected_bytes| streamed_bytes >= expected_bytes)
+        .unwrap_or(false)
+}
+
 #[derive(Clone)]
 struct StreamStatsContext {
     stats_store: StatsStore,
@@ -511,6 +524,7 @@ struct StreamStatsContext {
     bucket: String,
     path_and_query: String,
     object_key: Option<String>,
+    expected_bytes: Option<u64>,
     cache_status: StatsCacheStatus,
 }
 
@@ -544,6 +558,7 @@ fn stream_origin_body(
         let mut pending_write = pending_write;
         let mut streamed_bytes = 0_u64;
         let stats_context = stats_context;
+        let mut success_recorded = false;
 
         loop {
             let next_chunk = match upstream_body.try_next().await {
@@ -582,6 +597,25 @@ fn stream_origin_body(
             }
 
             streamed_bytes = streamed_bytes.saturating_add(chunk.len() as u64);
+            if !success_recorded
+                && should_record_stream_success(
+                    stats_context.as_ref().and_then(|context| context.expected_bytes),
+                    streamed_bytes,
+                )
+            {
+                if let Some(context) = stats_context.as_ref() {
+                    context.stats_store.record(StatsEvent {
+                        timestamp: context.timestamp,
+                        bucket: context.bucket.clone(),
+                        path_and_query: context.path_and_query.clone(),
+                        object_key: context.object_key.clone(),
+                        bytes: streamed_bytes,
+                        cache_status: context.cache_status,
+                        result: StatsResult::Success,
+                    }).await;
+                    success_recorded = true;
+                }
+            }
 
             yield chunk;
         }
@@ -592,7 +626,8 @@ fn stream_origin_body(
             }
         }
 
-        if let Some(context) = stats_context {
+        if !success_recorded {
+            if let Some(context) = stats_context {
             context.stats_store.record(StatsEvent {
                 timestamp: context.timestamp,
                 bucket: context.bucket,
@@ -602,6 +637,7 @@ fn stream_origin_body(
                 cache_status: context.cache_status,
                 result: StatsResult::Success,
             }).await;
+            }
         }
     }
 }
@@ -692,6 +728,27 @@ mod tests {
         apply_cache_status_header(&mut headers, CacheStatus::Hit);
 
         assert_eq!(headers.get("x-r2-proxy-cached").unwrap(), "HIT");
+    }
+
+    #[test]
+    fn records_stream_success_before_final_yield_when_length_known() {
+        assert!(should_record_stream_success(Some(1024), 1024));
+        assert!(should_record_stream_success(Some(1024), 2048));
+        assert!(!should_record_stream_success(Some(1024), 512));
+        assert!(!should_record_stream_success(None, 1024));
+    }
+
+    #[test]
+    fn lookup_miss_stays_miss_even_without_cache_fill() {
+        assert_eq!(response_cache_status(CacheStatus::Miss), CacheStatus::Miss);
+        assert_eq!(
+            response_cache_status(CacheStatus::Bypass),
+            CacheStatus::Bypass
+        );
+        assert_eq!(
+            response_cache_status(CacheStatus::Disabled),
+            CacheStatus::Disabled
+        );
     }
 
     #[test]
